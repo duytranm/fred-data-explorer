@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+fred_data.csv
+venv/
+.venv/
+.streamlit/secrets.toml
