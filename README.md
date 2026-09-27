@@ -57,14 +57,16 @@ Share a live link with anyone — no install on their end.
 1. Push this folder to a GitHub repo (public or private).
 2. Go to [share.streamlit.io](https://share.streamlit.io), sign in with GitHub, and click **New app**.
 3. Pick the repo/branch and set the main file path to `app.py`.
-4. Before deploying, open **Advanced settings → Secrets** and paste:
+4. (Optional) Before deploying, open **Advanced settings → Secrets** and paste:
    ```toml
    FRED_API_KEY = "your_fred_api_key_here"
    ```
    (get a free key at [fred.stlouisfed.org/docs/api/api_key.html](https://fred.stlouisfed.org/docs/api/api_key.html) if you don't have one)
 5. Click **Deploy**. The app reads the key from Streamlit's secrets automatically — `keyring`/Windows Credential Manager isn't available on Cloud, and the app already falls back past it.
 
-To test this exact path locally first: copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, fill in your key (that file is gitignored, so it never gets pushed), then `streamlit run app.py`.
+Setting a secret is optional: the app also has a "Your own FRED API key" field at the top of its sidebar, so anyone using the deployed app can paste their own free key for their session instead of relying on yours. Configuring the secret just means the app works out of the box without visitors needing their own key.
+
+To test the secrets path locally first: copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, fill in your key (that file is gitignored, so it never gets pushed), then `streamlit run app.py`.
 
 ## Troubleshooting
 

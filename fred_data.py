@@ -45,9 +45,9 @@ def get_api_key() -> str | None:
         return None
 
 
-def get_recession_series() -> pd.Series:
+def get_recession_series(api_key: str | None = None) -> pd.Series:
     """NBER recession indicator (USREC): 1 during a recession month, 0 otherwise."""
-    api_key = get_api_key()
+    api_key = api_key or get_api_key()
     if not api_key:
         raise ValueError("No FRED API key found. Run `python setup_api_key.py` once to store your key.")
     return Fred(api_key=api_key).get_series("USREC")

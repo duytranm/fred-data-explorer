@@ -5,3 +5,4 @@ fred_data.csv
 venv/
 .venv/
 .streamlit/secrets.toml
+.claude/

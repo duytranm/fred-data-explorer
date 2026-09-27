@@ -98,17 +98,39 @@ TRANSFORM_OPS = {
 
 st.title("FRED Data Explorer")
 
-if not get_api_key():
+with st.sidebar:
+    st.text_input(
+        "Your own FRED API key (optional)",
+        type="password",
+        key="user_api_key",
+        help=(
+            "Paste your own free FRED API key to use it for this session instead of the "
+            "key this app is configured with. Get one at "
+            "https://fred.stlouisfed.org/docs/api/api_key.html"
+        ),
+    )
+    st.divider()
+
+
+def resolve_api_key() -> str | None:
+    """The key to actually use: one typed into the sidebar for this session, else the
+    app's own configured key (Streamlit secrets / env var / local keyring)."""
+    typed = st.session_state.get("user_api_key", "").strip()
+    return typed or get_api_key()
+
+
+if not resolve_api_key():
     st.error(
-        "No FRED API key found. Run `python setup_api_key.py` in this folder once, "
-        "then reload this page."
+        "No FRED API key found. Paste your own free key in the sidebar (get one at "
+        "https://fred.stlouisfed.org/docs/api/api_key.html), or, if you're running this "
+        "locally, run `python setup_api_key.py` in this folder once and reload."
     )
     st.stop()
 
 
 @st.cache_data(show_spinner="Fetching from FRED...")
-def fetch(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
-    fd = FredDatasets()
+def fetch(series_ids: tuple[str, ...], start: str, end: str, _api_key: str) -> pd.DataFrame:
+    fd = FredDatasets(api_key=_api_key)
     for sid in series_ids:
         label = DEFAULT_SERIES.get(sid, sid)
         fd.add_series(sid, label, start=start, end=end)
@@ -220,7 +242,7 @@ def fetch_with_derived(selected_ids: tuple[str, ...], start: str, end: str) -> p
     for sid in selected_ids:
         base_needed |= collect_base_ids(sid, derived)
 
-    base_df = fetch(tuple(sorted(base_needed)), start, end)
+    base_df = fetch(tuple(sorted(base_needed)), start, end, resolve_api_key())
 
     cache: dict[str, pd.Series] = {}
     out = pd.DataFrame(index=base_df.index)
@@ -350,8 +372,8 @@ def export_chart_section(build_fig_fn, key_prefix: str, file_stem: str, date_bou
 
 
 @st.cache_data(show_spinner="Fetching NBER recession dates...")
-def fetch_recessions() -> pd.Series:
-    return get_recession_series()
+def fetch_recessions(_api_key: str) -> pd.Series:
+    return get_recession_series(_api_key)
 
 
 def pick_year_interval(start, end) -> int:
@@ -694,7 +716,7 @@ def publication_export_section(
         shade = st.checkbox("Shade NBER recessions", value=True, key=f"{key_prefix}_shade")
         if shade:
             try:
-                recession_series = fetch_recessions()
+                recession_series = fetch_recessions(resolve_api_key())
             except Exception as e:
                 st.warning(f"Couldn't load recession dates: {e}")
 
