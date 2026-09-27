@@ -25,7 +25,7 @@ import matplotlib.dates as mdates
 
 from fred_data import FredDatasets, get_api_key, get_recession_series, shade_recessions
 
-st.set_page_config(page_title="FRED Data Insight Explorer", layout="wide")
+st.set_page_config(page_title="FRED Data Insights Explorer", layout="wide")
 
 DEFAULT_PALETTE = px.colors.qualitative.Plotly  # cycled through when picking default line colors
 IMAGE_FORMATS = {"PNG": "image/png", "JPEG": "image/jpeg", "SVG": "image/svg+xml", "PDF": "application/pdf"}
@@ -96,7 +96,7 @@ TRANSFORM_OPS = {
     "Invert (1 / x)": (lambda s, p: 1 / s, None, 0),
 }
 
-st.title("FRED Data Insight Explorer")
+st.title("FRED Data Insights Explorer")
 
 with st.sidebar:
     st.text_input(
