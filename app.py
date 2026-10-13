@@ -10,10 +10,14 @@ Requires a FRED API key already stored via `python setup_api_key.py`
 
 import datetime
 import io
+import json
 import re
+import zlib
+from urllib.parse import parse_qsl, urlencode
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
@@ -24,6 +28,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 from fred_data import FredDatasets, get_api_key, get_recession_series, shade_recessions
+import nyfed_data as nyfed
 
 st.set_page_config(page_title="FRED Data Insights Explorer", layout="wide")
 
@@ -120,21 +125,58 @@ def resolve_api_key() -> str | None:
 
 
 if not resolve_api_key():
-    st.error(
-        "No FRED API key found. Paste your own free key in the sidebar (get one at "
-        "https://fred.stlouisfed.org/docs/api/api_key.html), or, if you're running this "
-        "locally, run `python setup_api_key.py` in this folder once and reload."
+    st.warning(
+        "No FRED API key found, so FRED series won't load. Paste your own free key in the sidebar "
+        "(get one at https://fred.stlouisfed.org/docs/api/api_key.html), or, if you're running this "
+        "locally, run `python setup_api_key.py` in this folder once and reload. The **NY Fed Markets** "
+        "tab and `NYFED:` series work without a key."
     )
-    st.stop()
+
+
+def base_label(sid: str) -> str:
+    """Default name for a base series: the curated FRED label, a NY Fed series label, or the ID."""
+    return DEFAULT_SERIES.get(sid) or nyfed.nyfed_label(sid) or sid
+
+
+def nyfed_beta() -> bool:
+    return st.session_state.get("nyfed_beta", False)
 
 
 @st.cache_data(show_spinner="Fetching from FRED...")
 def fetch(series_ids: tuple[str, ...], start: str, end: str, _api_key: str) -> pd.DataFrame:
     fd = FredDatasets(api_key=_api_key)
     for sid in series_ids:
-        label = DEFAULT_SERIES.get(sid, sid)
-        fd.add_series(sid, label, start=start, end=end)
+        fd.add_series(sid, base_label(sid), start=start, end=end)
     return fd.as_dataframe()
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching from the NY Fed...")
+def fetch_nyfed(sid: str, start: str, end: str, beta: bool) -> pd.Series:
+    return nyfed.get_series(sid, start, end, beta)
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching from the NY Fed...")
+def fetch_nyfed_json(path: str, params: dict, beta: bool):
+    return nyfed.get_json(path, params or None, beta)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def nyfed_pd_series(beta: bool) -> dict[str, str]:
+    return nyfed.list_pd_series(beta)
+
+
+def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
+    """Base series side by side: FRED IDs from FRED, `NYFED:` IDs from the NY Fed Markets API."""
+    fred_ids = tuple(s for s in series_ids if not nyfed.is_nyfed_id(s))
+    frames = [fetch(fred_ids, start, end, resolve_api_key())] if fred_ids else []
+    for sid in series_ids:
+        if not nyfed.is_nyfed_id(sid):
+            continue
+        try:
+            frames.append(fetch_nyfed(sid, start, end, nyfed_beta()).rename(base_label(sid)))
+        except (nyfed.NYFedError, requests.RequestException, KeyError) as e:
+            raise ValueError(f"Couldn't fetch {sid} from the NY Fed: {e}") from e
+    return pd.concat(frames, axis=1, sort=True) if frames else pd.DataFrame()
 
 
 def slugify(name: str) -> str:
@@ -152,7 +194,7 @@ def auto_series_label(sid: str) -> str:
     derived = get_derived_series()
     if sid in derived:
         return derived[sid]["display"]
-    return DEFAULT_SERIES.get(sid, sid)
+    return base_label(sid)
 
 
 def series_display_label(sid: str) -> str:
@@ -228,7 +270,7 @@ def resolve_series(sid: str, base_df: pd.DataFrame, derived: dict, cache: dict[s
             fn, _, _ = TRANSFORM_OPS[d["op"]]
             result = fn(src, d["param"])
     else:
-        result = base_df[DEFAULT_SERIES.get(sid, sid)]  # base_df's own column key is never renamed
+        result = base_df[base_label(sid)]  # base_df's own column key is never renamed
     cache[sid] = result
     return result
 
@@ -242,7 +284,7 @@ def fetch_with_derived(selected_ids: tuple[str, ...], start: str, end: str) -> p
     for sid in selected_ids:
         base_needed |= collect_base_ids(sid, derived)
 
-    base_df = fetch(tuple(sorted(base_needed)), start, end, resolve_api_key())
+    base_df = fetch_base(tuple(sorted(base_needed)), start, end)
 
     cache: dict[str, pd.Series] = {}
     out = pd.DataFrame(index=base_df.index)
@@ -405,7 +447,8 @@ def build_ts_figure(df: pd.DataFrame, label_colors: dict, y_label: str, bg_color
         raise ValueError("No data in the selected export range.")
     fig = go.Figure()
     for col in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df[col], mode="lines", name=col, line=dict(color=label_colors.get(col))))
+        s = df[col].dropna()  # series at different frequencies share one index; gaps would break their lines
+        fig.add_trace(go.Scatter(x=s.index, y=s, mode="lines", name=col, line=dict(color=label_colors.get(col))))
     fig.update_layout(
         height=500,
         yaxis_title=y_label,
@@ -816,7 +859,256 @@ with st.sidebar:
                 del derived_defs[slug]
                 st.rerun()
 
-tab_series, tab_relationship = st.tabs(["Time Series", "Relationship (X vs Y)"])
+NYFED_DATASETS = [
+    "Reference rates (SOFR, EFFR, OBFR, TGCR, BGCR)",
+    "SOFR averages and index",
+    "Agency MBS operations",
+    "Treasury securities operations",
+    "Repo and reverse repo operations",
+    "Reverse repo propositions",
+    "Securities lending operations",
+    "Central bank liquidity swaps",
+    "SOMA holdings: weekly summary",
+    "SOMA holdings: securities held as of a date",
+    "Primary dealer statistics: one series",
+    "Primary dealer statistics: latest survey",
+    "Primary dealer market share",
+    "Guide sheets",
+    "Custom endpoint",
+]
+
+
+# Preferred default "Values" column when charting a NY Fed table, in priority order.
+NYFED_HEADLINE_FIELDS = [
+    "percentRate", "volumeInBillions", "totalAmtAccepted", "totalAmtAcceptedPar", "totalParAmtAccepted",
+    "amtAccepted", "amount", "total", "parValue", "value",
+]
+
+
+def nyfed_date_range() -> dict | None:
+    today = datetime.date.today()
+    rng = st.date_input(
+        "Date range", value=(today - datetime.timedelta(days=90), today),
+        min_value=datetime.date(1990, 1, 1), max_value=today, key="nyfed_dates",
+    )
+    if len(rng) != 2:
+        st.info("Pick an end date too.")
+        return None
+    return {"startDate": rng[0].isoformat(), "endDate": rng[1].isoformat()}
+
+
+def nyfed_operation_controls(area: str, operations: list[str]) -> tuple[str, dict] | None:
+    """Shared controls for the operations endpoints shaped /api/<area>/<op>/results/<include>/search."""
+    c1, c2, c3 = st.columns([1, 1, 2])
+    op = c1.selectbox("Operation", operations, key=f"nyfed_{area}_op", format_func=str.capitalize)
+    include = c2.radio("Detail", ["summary", "details"], key=f"nyfed_{area}_include", format_func=str.capitalize)
+    with c3:
+        dates = nyfed_date_range()
+    return (f"/api/{area}/{op}/results/{include}/search.json", dates) if dates else None
+
+
+def nyfed_request_controls(dataset: str, beta: bool) -> tuple[str, dict] | None:
+    """Widgets for one dataset's options; returns the (path, query params) to request, or None
+    while the inputs are incomplete."""
+    if dataset.startswith("Reference rates"):
+        c1, c2 = st.columns([1, 2])
+        report = c1.radio("Report", ["rate", "volume"], key="nyfed_rate_type", format_func=str.capitalize)
+        with c2:
+            dates = nyfed_date_range()
+        return ("/api/rates/all/search.json", {**dates, "type": report}) if dates else None
+
+    if dataset == "SOFR averages and index":
+        dates = nyfed_date_range()
+        return ("/api/rates/secured/sofrai/search.json", dates) if dates else None
+
+    if dataset == "Agency MBS operations":
+        return nyfed_operation_controls("ambs", ["all", "purchases", "sales", "roll", "swap"])
+
+    if dataset == "Treasury securities operations":
+        return nyfed_operation_controls("tsy", ["all", "purchases", "sales"])
+
+    if dataset == "Securities lending operations":
+        return nyfed_operation_controls("seclending", ["all", "seclending", "extensions"])
+
+    if dataset == "Repo and reverse repo operations":
+        c1, c2 = st.columns([1, 2])
+        op_type = c1.selectbox(
+            "Operation type", ["all", "repo", "reverserepo"], key="nyfed_rp_type",
+            format_func={"all": "All", "repo": "Repo", "reverserepo": "Reverse repo"}.get,
+        )
+        with c2:
+            dates = nyfed_date_range()
+        if not dates:
+            return None
+        return "/api/rp/results/search.json", {**dates, **({"operationTypes": op_type} if op_type != "all" else {})}
+
+    if dataset == "Reverse repo propositions":
+        dates = nyfed_date_range()
+        return ("/api/rp/reverserepo/propositions/search.json", dates) if dates else None
+
+    if dataset == "Central bank liquidity swaps":
+        c1, c2, c3 = st.columns([1, 1, 2])
+        swap_type = c1.selectbox(
+            "Swaps", ["all", "usdollar", "nonusdollar"], key="nyfed_fxs_type",
+            format_func={"all": "All", "usdollar": "U.S. dollar", "nonusdollar": "Non-U.S. dollar"}.get,
+        )
+        date_type = c2.radio("Dates by", ["trade", "maturity"], key="nyfed_fxs_datetype", format_func=str.capitalize)
+        with c3:
+            dates = nyfed_date_range()
+        return (f"/api/fxs/{swap_type}/search.json", {**dates, "dateType": date_type}) if dates else None
+
+    if dataset == "SOMA holdings: weekly summary":
+        return "/api/soma/summary.json", {}
+
+    if dataset == "SOMA holdings: securities held as of a date":
+        as_of_dates = fetch_nyfed_json("/api/soma/asofdates/list.json", {}, beta)["soma"]["asOfDates"]
+        c1, c2, c3 = st.columns(3)
+        portfolio = c1.radio("Portfolio", ["tsy", "agency"], key="nyfed_soma_portfolio",
+                             format_func={"tsy": "Treasury", "agency": "Agency"}.get)
+        holding_types = ["all", "bills", "notesbonds", "frn", "tips"] if portfolio == "tsy" else ["all", "agency debts", "mbs", "cmbs"]
+        holding = c2.selectbox("Holding type", holding_types, key=f"nyfed_soma_holding_{portfolio}")
+        as_of = c3.selectbox("As of", as_of_dates, key="nyfed_soma_asof")
+        return f"/api/soma/{portfolio}/get/{holding}/asof/{as_of}.json", {}
+
+    if dataset == "Primary dealer statistics: one series":
+        options = nyfed_pd_series(beta)
+        keyid = st.selectbox("Series", list(options), format_func=lambda k: f"{k} — {options[k]}", key="nyfed_pd_keyid")
+        return f"/api/pd/get/{keyid}.json", {}
+
+    if dataset == "Primary dealer statistics: latest survey":
+        breaks = fetch_nyfed_json("/api/pd/list/seriesbreaks.json", {}, beta)["pd"]["seriesbreaks"]
+        labels = {b["seriesbreak"]: f"{b['label']} ({b['seriesbreak']})" for b in breaks}
+        sb = st.selectbox("Series break", list(labels), index=len(labels) - 1, format_func=labels.get, key="nyfed_pd_sb")
+        return f"/api/pd/latest/{sb}.json", {}
+
+    if dataset == "Primary dealer market share":
+        period = st.radio("Period", ["qtrly", "ytd"], horizontal=True, key="nyfed_ms_period",
+                          format_func={"qtrly": "Latest quarter", "ytd": "Year to date"}.get)
+        return f"/api/marketshare/{period}/latest.json", {}
+
+    if dataset == "Guide sheets":
+        c1, c2 = st.columns(2)
+        sheet = c1.selectbox("Guide sheet", ["si", "wi", "fs"], key="nyfed_gs_type",
+                             format_func={"si": "FR 2004SI", "wi": "FR 2004WI", "fs": "FR 2004F-series"}.get)
+        which = c2.radio("Edition", ["latest", "previous"], horizontal=True, key="nyfed_gs_which", format_func=str.capitalize)
+        return f"/api/guidesheets/{sheet}/{which}.json", {}
+
+    raw = st.text_input(
+        "Endpoint path (any JSON endpoint from the API docs)",
+        placeholder="/api/ambs/all/results/details/last/1.json", key="nyfed_custom_path",
+    ).strip()
+    st.caption(
+        "Copy any path from the [API docs](https://markets.newyorkfed.org/static/docs/markets-api.html) "
+        "with the `.json` format, including query parameters. Prefix it with `/beta` (or turn on beta "
+        "endpoints above) for the test versions."
+    )
+    if not raw:
+        return None
+    raw = raw.removeprefix(nyfed.BASE_URL)
+    if not nyfed.CUSTOM_PATH_RE.match(raw):
+        st.warning("That doesn't look like a Markets Data API path: it should start with `/api/` (or `/beta/api/`) and end in `.json`.")
+        return None
+    path, _, query = raw.partition("?")
+    return path, dict(parse_qsl(query))
+
+
+def render_nyfed_response(data, file_stem: str):
+    """Show every table in a response, with CSV download and a quick chart when it has dates."""
+    tables = {k: v for k, v in nyfed.json_tables(data).items() if not v.empty}
+    if not tables:
+        st.info("The API returned no records for this request.")
+        return
+    names = list(tables)
+    table_key = f"{zlib.crc32('|'.join(names).encode())}"
+    name = st.selectbox("Table", names, key=f"nyfed_table_{table_key}") if len(names) > 1 else names[0]
+    df = tables[name]
+    widget_key = f"{table_key}_{zlib.crc32(name.encode())}"
+
+    date_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
+    date_only = {
+        c: st.column_config.DateColumn(c) for c in date_cols
+        if (df[c].dropna() == df[c].dropna().dt.normalize()).all()
+    }
+    st.caption(f"{len(df):,} rows × {df.shape[1]} columns")
+    st.dataframe(df, use_container_width=True, height=380, column_config=date_only)
+    d1, d2 = st.columns(2)
+    d1.download_button(
+        "Download table as CSV", df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{file_stem}.csv", mime="text/csv", key=f"nyfed_csv_{widget_key}",
+    )
+    d2.download_button(
+        "Download raw JSON", json.dumps(data).encode("utf-8"),
+        file_name=f"{file_stem}.json", mime="application/json", key=f"nyfed_json_{widget_key}",
+    )
+
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c])]
+    if not (date_cols and num_cols and len(df) > 1):
+        return
+    split_cols = [
+        c for c in df.columns
+        if c not in date_cols and c not in num_cols and 1 < df[c].nunique() <= 12
+    ]
+    default_y = next((c for c in NYFED_HEADLINE_FIELDS if c in num_cols), num_cols[0])
+    split_options = ["(none)"] + split_cols
+    st.markdown("**Chart this table**")
+    c1, c2, c3, c4 = st.columns([2, 3, 2, 1])
+    x = c1.selectbox("Date column", date_cols, key=f"nyfed_x_{widget_key}")
+    ys = c2.multiselect("Values", num_cols, default=[default_y], key=f"nyfed_y_{widget_key}")
+    split = c3.selectbox(
+        "Split by", split_options, index=split_options.index("type") if "type" in split_cols else 0,
+        key=f"nyfed_split_{widget_key}",
+    )
+    kind = c4.radio("Type", ["Line", "Bar"], key=f"nyfed_kind_{widget_key}")
+    if not ys:
+        return
+    split = None if split == "(none)" else split
+    id_vars = [x] + ([split] if split else [])
+    plot = df[id_vars + ys].melt(id_vars=id_vars, value_vars=ys, var_name="field", value_name="value")
+    if split and len(ys) > 1:
+        plot["series"] = plot[split].astype(str) + " · " + plot["field"]
+    else:
+        plot["series"] = plot[split].astype(str) if split else plot["field"]
+    plot = plot.groupby([x, "series"], as_index=False)["value"].sum(min_count=1).dropna().sort_values(x)
+    fig = (px.line if kind == "Line" else px.bar)(plot, x=x, y="value", color="series")
+    fig.update_layout(height=420, margin=dict(l=40, r=20, t=30, b=40), legend_title_text=None)
+    st.plotly_chart(fig, use_container_width=True, key=f"nyfed_chart_{widget_key}")
+    st.caption("Rows that share a date (and split value) are summed.")
+
+
+tab_series, tab_relationship, tab_nyfed = st.tabs(["Time Series", "Relationship (X vs Y)", "NY Fed Markets"])
+
+# --- NY Fed Markets tab ----------------------------------------------------
+# Rendered before the other tabs because they call st.stop() when they have nothing to show.
+
+with tab_nyfed:
+    st.write(
+        "Browse the Federal Reserve Bank of New York's [Markets Data APIs]"
+        "(https://markets.newyorkfed.org/static/docs/markets-api.html): reference rates, open market "
+        "operations, SOMA holdings, primary dealer statistics and more. No API key needed. Time-series "
+        "datasets can also be charted with FRED data: pick them under **NY Fed Markets series** in the "
+        "Time Series sidebar."
+    )
+    beta = st.toggle(
+        "Use beta endpoints", key="nyfed_beta",
+        help="Sends every NY Fed request, here and in the other tabs, to the API's /beta versions, which "
+             "preview upcoming changes. Beta data are for testing only and aren't regularly maintained.",
+    )
+    dataset = st.selectbox("Dataset", NYFED_DATASETS, key="nyfed_dataset")
+    try:
+        request = nyfed_request_controls(dataset, beta)
+        if request:
+            path, params = request
+            shown_path = path if path.startswith("/beta/") or not beta else "/beta" + path
+            url = nyfed.BASE_URL + shown_path + (f"?{urlencode(params)}" if params else "")
+            st.caption(f"Request: `{url}`")
+            data = fetch_nyfed_json(path, params, beta)
+            render_nyfed_response(data, "nyfed_" + slugify(dataset).lower())
+    except (nyfed.NYFedError, requests.RequestException, KeyError, ValueError) as e:
+        st.error(f"Couldn't load this from the NY Fed: {e}")
+    st.caption(
+        "Data: Federal Reserve Bank of New York, subject to its "
+        "[Terms of Use](https://www.newyorkfed.org/privacy/termsofuse)."
+    )
 
 # --- Time Series tab -----------------------------------------------------
 
@@ -832,7 +1124,31 @@ with tab_series:
         )
         custom = st.text_input("Add a custom FRED series ID (comma-separated)", "")
         custom_ids = [c.strip().upper() for c in custom.split(",") if c.strip()]
-        series_ids = tuple(dict.fromkeys(chosen_labels + custom_ids))  # dedupe, keep order
+
+        with st.expander("NY Fed Markets series"):
+            nyfed_chosen = st.multiselect(
+                "Reference rates, SOMA holdings, repo operations",
+                options=list(nyfed.NYFED_SERIES), format_func=nyfed.NYFED_SERIES.get, key="ts_nyfed_series",
+            )
+            try:
+                pd_options = nyfed_pd_series(nyfed_beta())
+            except (nyfed.NYFedError, requests.RequestException, KeyError) as e:
+                pd_options = {}
+                st.caption(f"Couldn't load the primary dealer series list: {e}")
+            pd_chosen = st.multiselect(
+                "Primary dealer statistics", options=list(pd_options),
+                format_func=lambda k: f"{k} — {pd_options[k]}", key="ts_nyfed_pd",
+            )
+            st.caption(
+                "From the New York Fed's Markets Data APIs, no key needed. These IDs (e.g. `NYFED:SOFR`, "
+                "`NYFED:PD:PDPOSMBS-TOT`) also work anywhere a series ID is typed, including derived "
+                "series and the Relationship tab. Rates are daily and SOMA/dealer data weekly, so set "
+                "the resample frequency to Monthly when mixing them with monthly FRED series."
+            )
+
+        series_ids = tuple(dict.fromkeys(  # dedupe, keep order
+            chosen_labels + nyfed_chosen + [nyfed.PD_PREFIX + k for k in pd_chosen] + custom_ids
+        ))
 
         if series_ids:
             with st.expander("Rename series (legends, axes, exports)"):

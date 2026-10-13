@@ -11,6 +11,9 @@ An interactive Streamlit app for pulling data from [FRED](https://fred.stlouisfe
 - Manually group scatter points by color/shape — select on the chart (box/lasso), by a date-range slider, or auto-grouped by year/decade
 - Publication-style chart exports (matplotlib, with NBER recession shading) and interactive-style exports (PNG/JPEG/SVG/PDF), plus CSV downloads
 - Light theme, quick date-range presets (1Y/5Y/10Y/20Y/YTD/Max)
+- New York Fed [Markets Data APIs](https://markets.newyorkfed.org/static/docs/markets-api.html) (no key needed):
+  - Chart reference rates (SOFR, EFFR, OBFR, TGCR, BGCR, plus volumes and SOFR averages/index), SOMA holdings, Fed repo/reverse repo totals and any primary dealer statistic alongside FRED series. Pick them under **NY Fed Markets series** in the sidebar, or type IDs like `NYFED:SOFR` or `NYFED:PD:PDPOSMBS-TOT`.
+  - The **NY Fed Markets** tab browses every area of the API (operations, SOMA, primary dealers, market share, guide sheets, or any custom endpoint path) as tables with CSV/JSON downloads and quick charts, with an optional switch to the API's beta endpoints.
 
 ## Two ways to run this
 
@@ -80,6 +83,7 @@ To test the secrets path locally first: copy `.streamlit/secrets.toml.example` t
 |---|---|
 | `app.py` | The Streamlit app |
 | `fred_data.py` | FRED data-fetching helpers (`FredDatasets`, recession shading, API key lookup) |
+| `nyfed_data.py` | New York Fed Markets Data API client (charted `NYFED:` series, response-to-table flattening) |
 | `setup_api_key.py` | One-time CLI to store your FRED API key |
 | `requirements.txt` | Python dependencies |
 | `.streamlit/config.toml` | Light theme configuration |
