@@ -7,3 +7,4 @@ matplotlib>=3.8
 kaleido>=0.2
 keyring>=24.0
 requests>=2.31
+beaapi>=0.2

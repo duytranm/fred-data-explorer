@@ -14,6 +14,10 @@ An interactive Streamlit app for pulling data from [FRED](https://fred.stlouisfe
 - New York Fed [Markets Data APIs](https://markets.newyorkfed.org/static/docs/markets-api.html) (no key needed):
   - Chart reference rates (SOFR, EFFR, OBFR, TGCR, BGCR, plus volumes and SOFR averages/index), SOMA holdings, Fed repo/reverse repo totals and any primary dealer statistic alongside FRED series. Pick them under **NY Fed Markets series** in the sidebar, or type IDs like `NYFED:SOFR` or `NYFED:PD:PDPOSMBS-TOT`.
   - The **NY Fed Markets** tab browses every area of the API (operations, SOMA, primary dealers, market share, guide sheets, or any custom endpoint path) as tables with CSV/JSON downloads and quick charts, with an optional switch to the API's beta endpoints.
+- Bureau of Economic Analysis data via BEA's official [`beaapi`](https://github.com/us-bea/beaapi) library (free key: [apps.bea.gov/API/signup](https://apps.bea.gov/API/signup/)):
+  - The **BEA** tab covers every BEA API dataset (NIPA, GDP by industry, Regional, ITA, IIP, Input-Output, MNE and more), with parameter choices loaded from BEA's metadata.
+  - Chart any series from a fetched table, then add it to the Time Series and Relationship tabs to combine it with FRED and NY Fed data.
+  - Provide the key in the sidebar, as `BEA_API_KEY` in Streamlit secrets or an env var, or locally with `python setup_api_key.py --bea`.
 
 ## Two ways to run this
 
@@ -84,7 +88,8 @@ To test the secrets path locally first: copy `.streamlit/secrets.toml.example` t
 | `app.py` | The Streamlit app |
 | `fred_data.py` | FRED data-fetching helpers (`FredDatasets`, recession shading, API key lookup) |
 | `nyfed_data.py` | New York Fed Markets Data API client (charted `NYFED:` series, response-to-table flattening) |
-| `setup_api_key.py` | One-time CLI to store your FRED API key |
+| `bea_data.py` | BEA API helpers on top of `beaapi` (key lookup, parameter metadata, period parsing, series extraction) |
+| `setup_api_key.py` | One-time CLI to store your FRED API key (or your BEA key, with `--bea`) |
 | `requirements.txt` | Python dependencies |
 | `.streamlit/config.toml` | Light theme configuration |
 | `run.bat` / `run.sh` | One-click local launcher: sets up everything and starts the app |

@@ -1,55 +1,62 @@
 """
-One-time setup: store your FRED API key securely in the OS credential store
-(Windows Credential Manager) via `keyring`, so fred_data.py can pick it up
-automatically without an environment variable in every session.
+One-time setup: store your FRED (or BEA) API key securely in the OS credential store
+(Windows Credential Manager) via `keyring`, so the app can pick it up automatically
+without an environment variable in every session.
 
-Get a free key first: https://fredapi.stlouisfed.org/docs/api/api_key.html
+Get free keys first:
+    FRED: https://fredapi.stlouisfed.org/docs/api/api_key.html
+    BEA:  https://apps.bea.gov/API/signup/
 
 Usage:
-    python setup_api_key.py            # prompts and saves a key
-    python setup_api_key.py --check    # shows whether a key is currently stored
-    python setup_api_key.py --remove   # deletes the stored key
+    python setup_api_key.py            # prompts and saves a FRED key
+    python setup_api_key.py --check    # shows whether a FRED key is currently stored
+    python setup_api_key.py --remove   # deletes the stored FRED key
+    Add --bea to any of these to manage your BEA key instead, e.g. `python setup_api_key.py --bea`.
 """
 
 import sys
 import getpass
 import keyring
 
-KEYRING_SERVICE = "fred_api"
-KEYRING_USERNAME = "api_key"
+SERVICES = {
+    "FRED": ("fred_api", "api_key"),
+    "BEA": ("bea_api", "api_key"),
+}
 
 
-def save_key():
-    key = getpass.getpass("Paste your FRED API key (input hidden): ").strip()
+def save_key(name: str):
+    key = getpass.getpass(f"Paste your {name} API key (input hidden): ").strip()
     if not key:
         print("No key entered, nothing saved.")
         return
-    keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, key)
-    print("Saved. fred_data.py will now find it automatically via keyring.")
+    keyring.set_password(*SERVICES[name], key)
+    print(f"Saved. The app will now find your {name} key automatically via keyring.")
 
 
-def check_key() -> bool:
-    key = keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+def check_key(name: str = "FRED") -> bool:
+    key = keyring.get_password(*SERVICES[name])
     if key:
-        print(f"A key is stored (ends in ...{key[-4:]}).")
+        print(f"A {name} key is stored (ends in ...{key[-4:]}).")
     else:
-        print("No key stored yet. Run `python setup_api_key.py` to add one.")
+        flag = " --bea" if name == "BEA" else ""
+        print(f"No {name} key stored yet. Run `python setup_api_key.py{flag}` to add one.")
     return bool(key)
 
 
-def remove_key():
-    if keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME):
-        keyring.delete_password(KEYRING_SERVICE, KEYRING_USERNAME)
-        print("Removed stored key.")
+def remove_key(name: str):
+    if keyring.get_password(*SERVICES[name]):
+        keyring.delete_password(*SERVICES[name])
+        print(f"Removed stored {name} key.")
     else:
-        print("No key was stored.")
+        print(f"No {name} key was stored.")
 
 
 if __name__ == "__main__":
-    arg = sys.argv[1] if len(sys.argv) > 1 else None
-    if arg == "--check":
-        sys.exit(0 if check_key() else 1)
-    elif arg == "--remove":
-        remove_key()
+    args = sys.argv[1:]
+    name = "BEA" if "--bea" in args else "FRED"
+    if "--check" in args:
+        sys.exit(0 if check_key(name) else 1)
+    elif "--remove" in args:
+        remove_key(name)
     else:
-        save_key()
+        save_key(name)

@@ -29,6 +29,7 @@ import matplotlib.dates as mdates
 
 from fred_data import FredDatasets, get_api_key, get_recession_series, shade_recessions
 import nyfed_data as nyfed
+import bea_data as bea
 
 st.set_page_config(page_title="FRED Data Insights Explorer", layout="wide")
 
@@ -114,6 +115,15 @@ with st.sidebar:
             "https://fred.stlouisfed.org/docs/api/api_key.html"
         ),
     )
+    st.text_input(
+        "Your own BEA API key (optional)",
+        type="password",
+        key="user_bea_key",
+        help=(
+            "Paste your own free Bureau of Economic Analysis key to use BEA data in this session "
+            "instead of the key this app is configured with. Get one at https://apps.bea.gov/API/signup/"
+        ),
+    )
     st.divider()
 
 
@@ -122,6 +132,12 @@ def resolve_api_key() -> str | None:
     app's own configured key (Streamlit secrets / env var / local keyring)."""
     typed = st.session_state.get("user_api_key", "").strip()
     return typed or get_api_key()
+
+
+def resolve_bea_key() -> str | None:
+    """Like resolve_api_key, for the BEA key (sidebar, then secrets / env var / keyring)."""
+    typed = st.session_state.get("user_bea_key", "").strip()
+    return typed or bea.get_bea_key()
 
 
 if not resolve_api_key():
@@ -133,8 +149,15 @@ if not resolve_api_key():
     )
 
 
+def get_bea_series() -> dict:
+    """BEA series added from the BEA tab this session: ID -> {dataset, params, filters, label}."""
+    return st.session_state.setdefault("bea_series", {})
+
+
 def base_label(sid: str) -> str:
-    """Default name for a base series: the curated FRED label, a NY Fed series label, or the ID."""
+    """Default name for a base series: the curated FRED label, a NY Fed or BEA series label, or the ID."""
+    if sid in get_bea_series():
+        return get_bea_series()[sid]["label"]
     return DEFAULT_SERIES.get(sid) or nyfed.nyfed_label(sid) or sid
 
 
@@ -165,17 +188,51 @@ def nyfed_pd_series(beta: bool) -> dict[str, str]:
     return nyfed.list_pd_series(beta)
 
 
+# BEA metadata changes rarely; data at most a few times a day. The key is left out of the cache
+# key (leading underscore): results are the same public data whichever valid key fetched them.
+@st.cache_data(ttl=86400, show_spinner="Loading BEA datasets...")
+def bea_datasets(_key: str) -> pd.DataFrame:
+    return bea.dataset_list(_key)
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading BEA parameters...")
+def bea_params(dataset: str, _key: str) -> pd.DataFrame:
+    return bea.parameter_list(_key, dataset)
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading BEA parameter values...")
+def bea_param_values(dataset: str, param: str, filters: tuple, _key: str) -> dict[str, str]:
+    return bea.parameter_values(_key, dataset, param, dict(filters))
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching from BEA...")
+def bea_table(dataset: str, params: tuple, _key: str) -> tuple[pd.DataFrame, list[str], str]:
+    return bea.get_table(_key, dataset, dict(params))
+
+
 def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
-    """Base series side by side: FRED IDs from FRED, `NYFED:` IDs from the NY Fed Markets API."""
-    fred_ids = tuple(s for s in series_ids if not nyfed.is_nyfed_id(s))
+    """Base series side by side: FRED IDs from FRED, `NYFED:` IDs from the NY Fed Markets API,
+    `BEA:` IDs from BEA."""
+    fred_ids = tuple(s for s in series_ids if not (nyfed.is_nyfed_id(s) or bea.is_bea_id(s)))
     frames = [fetch(fred_ids, start, end, resolve_api_key())] if fred_ids else []
     for sid in series_ids:
-        if not nyfed.is_nyfed_id(sid):
-            continue
-        try:
-            frames.append(fetch_nyfed(sid, start, end, nyfed_beta()).rename(base_label(sid)))
-        except (nyfed.NYFedError, requests.RequestException, KeyError) as e:
-            raise ValueError(f"Couldn't fetch {sid} from the NY Fed: {e}") from e
+        if nyfed.is_nyfed_id(sid):
+            try:
+                frames.append(fetch_nyfed(sid, start, end, nyfed_beta()).rename(base_label(sid)))
+            except (nyfed.NYFedError, requests.RequestException, KeyError) as e:
+                raise ValueError(f"Couldn't fetch {sid} from the NY Fed: {e}") from e
+        elif bea.is_bea_id(sid):
+            spec = get_bea_series().get(sid)
+            if spec is None:
+                raise ValueError(f"{sid} isn't a BEA series added in this session. Add it from the BEA tab.")
+            if not resolve_bea_key():
+                raise ValueError("A BEA API key is needed for BEA series. Paste one in the sidebar.")
+            try:
+                table, _, _ = bea_table(spec["dataset"], tuple(spec["params"].items()), resolve_bea_key())
+            except (*bea.BEAError, OSError) as e:
+                raise ValueError(f"Couldn't fetch {sid} from BEA: {e}") from e
+            s = bea.series_values(table, spec["filters"]).loc[start:end]
+            frames.append(s.rename(base_label(sid)))
     return pd.concat(frames, axis=1, sort=True) if frames else pd.DataFrame()
 
 
@@ -1075,7 +1132,212 @@ def render_nyfed_response(data, file_stem: str):
     st.caption("Rows that share a date (and split value) are summed.")
 
 
-tab_series, tab_relationship, tab_nyfed = st.tabs(["Time Series", "Relationship (X vs Y)", "NY Fed Markets"])
+# Parameters that pick a table come first so the remaining parameters' value lists can be
+# narrowed to that table; Year goes last for the same reason.
+BEA_PARAM_PRIORITY = ["TableName", "TableID", "Indicator", "Component", "TypeOfInvestment", "TypeOfService", "Frequency"]
+
+
+def bea_param_order(names: list[str]) -> list[str]:
+    def rank(item):
+        i, name = item
+        if name in BEA_PARAM_PRIORITY:
+            return (0, BEA_PARAM_PRIORITY.index(name))
+        return (2, i) if name == "Year" else (1, i)
+    return [name for _, name in sorted(enumerate(names), key=rank)]
+
+
+def bea_text(value) -> str:
+    """A BEA metadata field as text; BEA leaves many blank, which beaapi returns as NA."""
+    return "" if value is None or (not isinstance(value, str) and pd.isna(value)) else str(value).strip()
+
+
+def bea_param_widget(dataset: str, p: pd.Series, chosen: dict, key: str) -> str:
+    """One parameter's input, using BEA's list of allowed values when it has one. Returns the
+    value to send ('' if none), with multiple picks joined by commas as BEA expects."""
+    name = p["ParameterName"]
+    filters = tuple(sorted(chosen.items())) if dataset not in bea.NO_FILTERED_VALUES else ()
+    try:
+        values = bea_param_values(dataset, name, filters, key)
+    except (*bea.BEAError, OSError, KeyError):  # no usable value list: fall back to typing the value
+        values = {}
+    if dataset == "Regional" and name == "GeoFips" and values:
+        values = {**bea.REGIONAL_GEO_KEYWORDS, **values}
+    all_value = bea_text(p.get("AllValue"))
+    default_value = bea_text(p.get("ParameterDefaultValue"))
+    label = name + (" *" if p["required"] else "")
+    widget_key = f"bea_{dataset}_{name}"
+    help_text = bea_text(p.get("ParameterDescription")) or None
+
+    if not values:
+        return st.text_input(label, value=default_value, help=help_text, key=widget_key).strip()
+
+    def fmt(k):
+        return "All" if k == all_value else f"{k} — {values.get(k, '')}"[:160]
+
+    if p["multi"]:
+        options = ([all_value] if all_value else []) + [k for k in values if k != all_value]
+        if name == "Year":
+            default = [all_value] if all_value else sorted(values, reverse=True)[:10]
+        else:
+            default = [default_value] if default_value in options else []
+        picked = st.multiselect(label, options, default=default, format_func=fmt, help=help_text, key=widget_key)
+        if dataset == "Regional" and name == "GeoFips" and len(picked) > 1 and set(picked) & set(bea.REGIONAL_GEO_KEYWORDS):
+            st.warning("BEA ignores an \"All ...\" choice combined with other areas. Pick either one \"All ...\" option or specific areas.")
+        return ",".join(picked)
+
+    options = list(values)
+    index = options.index(default_value) if default_value in options else None
+    picked = st.selectbox(
+        label, options, index=index, format_func=fmt, placeholder="Choose...", help=help_text, key=widget_key,
+    )
+    return picked or ""
+
+
+def bea_param_controls(dataset: str, key: str) -> tuple[dict, list[str]]:
+    """Inputs for every parameter of a BEA dataset. Returns the chosen {parameter: value} and
+    the required parameters still left empty."""
+    params = bea_params(dataset, key).copy()
+    params["required"] = params["ParameterIsRequiredFlag"].map(bea_text) == "1"
+    params["multi"] = params["MultipleAcceptedFlag"].map(bea_text) == "1"
+    # NIPA-style datasets accept either TableName or the deprecated TableID, so BEA flags
+    # neither as required; treat the preferred one as required so it isn't buried.
+    table_params = params["ParameterName"].isin(["TableName", "TableID"])
+    if table_params.any() and not params.loc[table_params, "required"].any():
+        preferred = "TableName" if (params["ParameterName"] == "TableName").any() else "TableID"
+        params.loc[params["ParameterName"] == preferred, "required"] = True
+    params = params.set_index("ParameterName", drop=False).loc[bea_param_order(list(params["ParameterName"]))]
+
+    chosen, missing = {}, []
+    required, optional = params[params["required"]], params[~params["required"]]
+    if required.empty:  # e.g. ITA, IIP: every parameter is optional, but some must still be set
+        required, optional = optional, optional.iloc[0:0]
+    cols = st.columns(2)
+    for i, (_, p) in enumerate(required.iterrows()):
+        with cols[i % 2]:
+            value = bea_param_widget(dataset, p, chosen, key)
+        if value:
+            chosen[p["ParameterName"]] = value
+        elif p["required"]:
+            missing.append(p["ParameterName"])
+    if not optional.empty:
+        with st.expander("Optional parameters"):
+            for _, p in optional.iterrows():
+                value = bea_param_widget(dataset, p, chosen, key)
+                if value:
+                    chosen[p["ParameterName"]] = value
+    return chosen, missing
+
+
+def render_bea_table(dataset: str, params: tuple, key: str):
+    df, keys, statistic = bea_table(dataset, params, key)
+    st.caption(
+        f"**{dataset}** · " + " · ".join(f"{k}={v}" for k, v in params) + f" — {len(df):,} rows"
+        + (f" · {statistic}" if statistic else "")
+    )
+    request_key = f"{zlib.crc32(repr((dataset, params)).encode())}"
+    st.dataframe(
+        df, use_container_width=True, height=320,
+        column_config={"Date": st.column_config.DateColumn("Date")} if "Date" in df.columns else None,
+    )
+    st.download_button(
+        "Download table as CSV", df.to_csv(index=False).encode("utf-8"),
+        file_name=f"bea_{dataset.lower()}.csv", mime="text/csv", key=f"bea_csv_{request_key}",
+    )
+
+    catalog = bea.series_catalog(df, keys, statistic)
+    if catalog.empty or not df["Date"].notna().any():
+        return
+    st.markdown("**Chart series from this table**")
+    labels = catalog["label"].tolist()
+    picked = st.multiselect(
+        f"Series ({len(catalog):,} in this table)", list(range(len(catalog))), default=[0],
+        format_func=lambda i: labels[i], key=f"bea_pick_{request_key}",
+    )
+    if not picked:
+        return
+    filters_for = {i: {k: str(catalog.iloc[i][k]) for k in keys} for i in picked}
+    long = pd.concat([
+        bea.series_values(df, filters_for[i]).rename("value").rename_axis("Date").reset_index().assign(series=labels[i])
+        for i in picked
+    ])
+    fig = px.line(long.dropna(), x="Date", y="value", color="series", markers=len(long) <= 60)
+    fig.update_layout(height=420, margin=dict(l=40, r=20, t=30, b=40), legend_title_text=None,
+                      legend=dict(orientation="h", yanchor="top", y=-0.15))
+    st.plotly_chart(fig, use_container_width=True, key=f"bea_chart_{request_key}")
+    units = sorted({catalog.iloc[i]["unit"] for i in picked if catalog.iloc[i]["unit"]})
+    if units:
+        st.caption("Units: " + "; ".join(units))
+
+    if st.button("Add to the Time Series and Relationship tabs", key=f"bea_add_{request_key}"):
+        added = []
+        for i in picked:
+            unit = catalog.iloc[i]["unit"]
+            spec = {
+                "dataset": dataset, "params": dict(params), "filters": filters_for[i],
+                "label": f"{labels[i]} ({unit})" if unit else labels[i],
+            }
+            sid = f"{bea.BEA_PREFIX}{slugify(labels[i])[:32]}_{zlib.crc32(repr(spec).encode()) & 0xFFFF:04X}"
+            get_bea_series()[sid] = spec
+            added.append(sid)
+        st.session_state["ts_bea_series"] = list(dict.fromkeys(st.session_state.get("ts_bea_series", []) + added))
+        st.success(
+            "Added and selected in the Time Series sidebar (under **BEA series**). In the Relationship "
+            "tab or a derived series, use the ID: " + ", ".join(f"`{s}`" for s in added)
+        )
+
+
+tab_series, tab_relationship, tab_nyfed, tab_bea = st.tabs(
+    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA"]
+)
+
+# --- BEA tab ---------------------------------------------------------------
+# Rendered before the Time Series tab so a series added here is selectable there on the same run.
+
+with tab_bea:
+    st.write(
+        "Pull data from the U.S. Bureau of Economic Analysis using BEA's official "
+        "[`beaapi`](https://github.com/us-bea/beaapi) library: GDP and the national accounts (NIPA), "
+        "GDP by industry, regional income and GDP by state, county and metro area, international "
+        "transactions and investment, input-output tables and more. Add any series to the Time Series "
+        "and Relationship tabs to chart it alongside FRED and NY Fed data."
+    )
+    bea_key = resolve_bea_key()
+    if not bea_key:
+        st.info(
+            "BEA data needs a free API key. Sign up at https://apps.bea.gov/API/signup/ (BEA emails the "
+            "key to you), then paste it into **Your own BEA API key** in the sidebar. To set one for the "
+            "whole app, add `BEA_API_KEY` to the app's Streamlit secrets, or run "
+            "`python setup_api_key.py --bea` when running locally."
+        )
+    else:
+        try:
+            datasets = bea_datasets(bea_key)
+            descriptions = dict(zip(datasets["DatasetName"], datasets["DatasetDescription"]))
+            dataset = st.selectbox(
+                "Dataset", list(descriptions), format_func=lambda n: f"{n} — {descriptions[n]}", key="bea_dataset",
+            )
+            chosen, missing = bea_param_controls(dataset, bea_key)
+            if missing:
+                st.caption("Still needed: " + ", ".join(missing) + " (* marks required parameters).")
+            if st.button("Get data", type="primary", disabled=bool(missing), key="bea_get"):
+                st.session_state["bea_request"] = (dataset, tuple(chosen.items()))
+                st.session_state.pop("bea_error", None)
+            request = st.session_state.get("bea_request")
+            if request and request[0] == dataset:
+                try:
+                    render_bea_table(*request, bea_key)
+                except (*bea.BEAError, OSError) as e:
+                    # Forget a failed request so later reruns don't resend it: BEA throttles
+                    # keys that make too many failing calls.
+                    st.session_state.pop("bea_request")
+                    st.session_state["bea_error"] = (dataset, str(e))
+            if st.session_state.get("bea_error", (None,))[0] == dataset:
+                st.error(f"BEA request failed: {st.session_state['bea_error'][1]}")
+        except (*bea.BEAError, OSError) as e:
+            st.error(f"BEA request failed: {e}")
+        except Exception as e:  # an unexpected response shape shouldn't take down the other tabs
+            st.error(f"Couldn't display this BEA data ({type(e).__name__}: {e}). Try different parameters.")
+    st.caption("Data: U.S. Bureau of Economic Analysis.")
 
 # --- NY Fed Markets tab ----------------------------------------------------
 # Rendered before the other tabs because they call st.stop() when they have nothing to show.
@@ -1146,8 +1408,17 @@ with tab_series:
                 "the resample frequency to Monthly when mixing them with monthly FRED series."
             )
 
+        bea_defs = get_bea_series()
+        with st.expander("BEA series", expanded=bool(st.session_state.get("ts_bea_series"))):
+            bea_chosen = st.multiselect(
+                "Series added from the BEA tab", options=list(bea_defs),
+                format_func=lambda sid: bea_defs[sid]["label"], key="ts_bea_series",
+            )
+            if not bea_defs:
+                st.caption("Fetch a table in the **BEA** tab, then add series from it to chart them here.")
+
         series_ids = tuple(dict.fromkeys(  # dedupe, keep order
-            chosen_labels + nyfed_chosen + [nyfed.PD_PREFIX + k for k in pd_chosen] + custom_ids
+            chosen_labels + nyfed_chosen + [nyfed.PD_PREFIX + k for k in pd_chosen] + bea_chosen + custom_ids
         ))
 
         if series_ids:
