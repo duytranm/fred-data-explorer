@@ -26,6 +26,9 @@ An interactive Streamlit app for pulling data from [FRED](https://fred.stlouisfe
   - The **BLS** tab browses each survey's most popular series or takes any series IDs, over a year-range slider, splitting long ranges into as many requests as BLS's limits need.
   - BLS series chart alongside everything else as `BLS:<series ID>` (e.g. `BLS:LNS14000000`), from the **BLS series** sidebar picker or typed anywhere a series ID is accepted.
   - Works without a key, but only 25 requests a day (shared by everyone using a deployed app), 10 years per request and no series titles. `BLS_API_KEY` in Streamlit secrets or an env var (or locally `python setup_api_key.py --bls`) raises that to 500 a day and 20 years, with titles.
+- U.S. Treasury [Fiscal Data API](https://fiscaldata.treasury.gov/api-documentation/) (no key needed):
+  - The **Treasury** tab covers every Fiscal Data dataset and table (Debt to the Penny, Daily and Monthly Treasury Statements, average interest rates, exchange rates, auctions and more), loaded from Fiscal Data's metadata service, with a date-range slider and an optional filter on any text field.
+  - Series from a fetched table can be added to the Time Series and Relationship tabs. Results are capped at 100,000 rows per request, with a notice when a query matches more.
 
 ## Two ways to run this
 
@@ -100,6 +103,7 @@ To test the secrets path locally first: copy `.streamlit/secrets.toml.example` t
 | `bea_data.py` | BEA API helpers on top of `beaapi` (key lookup, parameter metadata, period parsing, series extraction) |
 | `census_data.py` | Census Data API client (dataset catalog, variables, geography, queries, time parsing) |
 | `bls_data.py` | BLS Public Data API v2 client (surveys, popular series, chunked data requests, period parsing) |
+| `treasury_data.py` | Treasury Fiscal Data API client (metadata catalog, distinct values, paged and filtered queries) |
 | `setup_api_key.py` | One-time CLI to store your FRED API key (or your BEA / Census / BLS key, with `--bea` / `--census` / `--bls`) |
 | `requirements.txt` | Python dependencies |
 | `.streamlit/config.toml` | Light theme configuration |

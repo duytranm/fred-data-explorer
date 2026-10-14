@@ -32,6 +32,7 @@ import nyfed_data as nyfed
 import bea_data as bea
 import census_data as census
 import bls_data as bls
+import treasury_data as treasury
 
 st.set_page_config(page_title="FREDDIE, BEAtrice & ADLER", layout="wide")
 
@@ -129,13 +130,20 @@ def get_census_series() -> dict:
     return st.session_state.setdefault("census_series", {})
 
 
+def get_treasury_series() -> dict:
+    """Treasury series added from the Treasury tab this session: ID -> query spec and label."""
+    return st.session_state.setdefault("treasury_series", {})
+
+
 def base_label(sid: str) -> str:
-    """Default name for a base series: the curated FRED label, a NY Fed, BEA or Census series
-    label, or the ID."""
+    """Default name for a base series: the curated FRED label, a NY Fed, BEA, Census, BLS or
+    Treasury series label, or the ID."""
     if sid in get_bea_series():
         return get_bea_series()[sid]["label"]
     if sid in get_census_series():
         return get_census_series()[sid]["label"]
+    if sid in get_treasury_series():
+        return get_treasury_series()[sid]["label"]
     if bls.is_bls_id(sid):
         return st.session_state.get("bls_titles", {}).get(sid[len(bls.BLS_PREFIX):]) or f"BLS {sid[len(bls.BLS_PREFIX):]}"
     return DEFAULT_SERIES.get(sid) or nyfed.nyfed_label(sid) or sid
@@ -250,12 +258,31 @@ def bls_fetch_with_titles(series_ids: tuple[str, ...], start_year: int, end_year
     return data, notes
 
 
+@st.cache_data(ttl=86400, show_spinner="Loading the Treasury Fiscal Data catalog...")
+def treasury_catalog() -> list[dict]:
+    return treasury.catalog()
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading values...")
+def treasury_distinct(endpoint: str, field: str) -> list[str]:
+    return treasury.distinct_values(endpoint, field)
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching from Treasury Fiscal Data...")
+def treasury_table(endpoint: str, fields: tuple, date_field: str | None, start: str | None, end: str | None,
+                   filter_field: str | None, filter_values: tuple) -> tuple[pd.DataFrame, int]:
+    field_dicts = [{"name": n, "type": t, "label": lb} for n, t, lb in fields]
+    return treasury.get_data(endpoint, field_dicts, date_field, start, end, filter_field, filter_values)
+
+
 def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
     """Base series side by side: FRED IDs from FRED, `NYFED:` IDs from the NY Fed Markets API,
-    `BEA:` IDs from BEA, `CENSUS:` IDs from the Census Bureau, `BLS:` IDs from BLS."""
+    `BEA:` IDs from BEA, `CENSUS:` IDs from the Census Bureau, `BLS:` IDs from BLS,
+    `TREASURY:` IDs from Treasury Fiscal Data."""
     fred_ids = tuple(
         s for s in series_ids
-        if not (nyfed.is_nyfed_id(s) or bea.is_bea_id(s) or census.is_census_id(s) or bls.is_bls_id(s))
+        if not (nyfed.is_nyfed_id(s) or bea.is_bea_id(s) or census.is_census_id(s) or bls.is_bls_id(s)
+                or treasury.is_treasury_id(s))
     )
     frames = [fetch(fred_ids, start, end, get_api_key())] if fred_ids else []
     bls_ids = tuple(s for s in series_ids if bls.is_bls_id(s))
@@ -296,6 +323,20 @@ def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFram
                 raise ValueError(f"Couldn't fetch {sid} from the Census Bureau: {e}") from e
             s = census.series_values(table, spec["filters"], spec["value_col"]).loc[start:end]
             frames.append(s.rename(base_label(sid)))
+        elif treasury.is_treasury_id(sid):
+            spec = get_treasury_series().get(sid)
+            if spec is None:
+                raise ValueError(f"{sid} isn't a Treasury series added in this session. Add it from the Treasury tab.")
+            endpoint, fields, date_field, filter_field, filter_values = spec["query"]
+            try:
+                table, _ = treasury_table(endpoint, fields, date_field, start, end, filter_field, filter_values)
+            except (treasury.TreasuryError, requests.RequestException) as e:
+                raise ValueError(f"Couldn't fetch {sid} from Treasury Fiscal Data: {e}") from e
+            if table.empty:
+                frames.append(pd.Series(dtype=float, index=pd.DatetimeIndex([]), name=base_label(sid)))
+            else:
+                s = treasury.series_values(table, spec["filters"], spec["value_col"], date_field)
+                frames.append(s.rename(base_label(sid)))
     return pd.concat(frames, axis=1, sort=True) if frames else pd.DataFrame()
 
 
@@ -1670,9 +1711,164 @@ def render_bls_result(series_ids: tuple, start_year: int, end_year: int):
         )
 
 
-tab_series, tab_relationship, tab_nyfed, tab_bea, tab_census, tab_bls = st.tabs(
-    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA", "Census", "BLS"]
+def treasury_request_controls() -> tuple | None:
+    """Inputs for a Treasury Fiscal Data request. Returns (table, start, end, filter field,
+    filter values) or None."""
+    cat = treasury_catalog()
+    ds_i = st.selectbox(
+        f"Dataset ({len(cat)}, most viewed first)", range(len(cat)), format_func=lambda i: cat[i]["title"],
+        key="treasury_dataset",
+    )
+    ds = cat[ds_i]
+    tables = ds["tables"]
+    tb_i = st.selectbox(
+        f"Table ({len(tables)})", range(len(tables)), format_func=lambda i: tables[i]["name"],
+        key=f"treasury_table_{ds['title']}",
+    ) if len(tables) > 1 else 0
+    tb = tables[tb_i]
+    st.caption(
+        " · ".join(x for x in [tb["frequency"], f"{tb['earliest']} to {tb['latest']}", f"{tb['rows']:,} rows"] if x)
+        + (f" — {tb['description'][:300]}" if tb["description"] else "")
+    )
+    start = end = None
+    try:
+        lo, hi = datetime.date.fromisoformat(tb["earliest"]), datetime.date.fromisoformat(tb["latest"])
+    except (TypeError, ValueError):
+        lo = hi = None
+    if tb["date_field"] and lo and hi and lo < hi:
+        default_lo = max(lo, hi - datetime.timedelta(days=round(365.25 * 10)))
+        start, end = st.slider(
+            "Dates", min_value=lo, max_value=hi, value=(default_lo, hi), format="YYYY-MM-DD",
+            key=f"treasury_dates_{tb['endpoint']}",
+        )
+        start, end = start.isoformat(), end.isoformat()
+    labels = {f["name"]: f["label"] for f in tb["fields"]}
+    text_fields = [f["name"] for f in tb["fields"] if f["type"] == "STRING"]
+    filter_field = st.selectbox(
+        "Filter by (optional)", [None] + text_fields, key=f"treasury_filter_field_{tb['endpoint']}",
+        format_func=lambda n: "(no filter)" if n is None else f"{labels[n]} ({n})",
+    )
+    values: tuple = ()
+    if filter_field:
+        options = treasury_distinct(tb["endpoint"], filter_field)
+        values = tuple(st.multiselect(
+            f"{labels[filter_field]} to include ({len(options):,} values)", options,
+            key=f"treasury_filter_values_{tb['endpoint']}_{filter_field}",
+        ))
+    return tb, start, end, filter_field, values
+
+
+def render_treasury_table(tb: dict, start: str | None, end: str | None, filter_field: str | None, values: tuple):
+    fields = tuple((f["name"], f["type"], f["label"]) for f in tb["fields"])
+    df, total = treasury_table(tb["endpoint"], fields, tb["date_field"], start, end, filter_field, values)
+    request_key = f"{zlib.crc32(repr((tb['endpoint'], start, end, filter_field, values)).encode())}"
+    if df.empty:
+        st.info("No rows match: try a wider date range or other filter values.")
+        return
+    st.caption(f"**{tb['name']}** ({tb['endpoint']}) — {len(df):,} rows")
+    if total > len(df):
+        st.warning(f"Showing the first {len(df):,} of {total:,} matching rows. Narrow the dates or add a filter.")
+    date_cols = {f["name"]: st.column_config.DateColumn(f["name"]) for f in tb["fields"]
+                 if f["type"] == "DATE" and f["name"] in df.columns}
+    st.dataframe(df, use_container_width=True, height=320, column_config=date_cols)
+    st.download_button(
+        "Download table as CSV", df.to_csv(index=False).encode("utf-8"),
+        file_name=f"treasury_{tb['endpoint'].rsplit('/', 1)[-1]}.csv", mime="text/csv",
+        key=f"treasury_csv_{request_key}",
+    )
+    date_field = tb["date_field"]
+    vcols = treasury.value_cols(df, tb["fields"])
+    if not date_field or date_field not in df.columns or not vcols:
+        return
+    labels = {f["name"]: f["label"] for f in tb["fields"]}
+    st.markdown("**Chart**")
+    total_i = next((i for i, c in enumerate(vcols) if labels.get(c, c).lower().startswith("total")), 0)
+    value_col = st.selectbox(
+        "Value", vcols, index=total_i, format_func=lambda c: labels.get(c, c), key=f"treasury_value_{request_key}",
+    )
+
+    keys = treasury.series_key_cols(df, tb["fields"])
+    catalog = df.drop_duplicates(keys)[keys].reset_index(drop=True) if keys else pd.DataFrame(index=[0])
+    # Label each series by one field when one alone tells them apart (preferring a description
+    # field), e.g. 'Canada-Dollar' rather than 'Canada · Dollar · Canada-Dollar'.
+    label_keys = next(
+        ([k] for k in sorted(keys, key=lambda k: (not k.endswith("_desc"), keys.index(k)))
+         if catalog[k].nunique() == len(catalog)), keys,
+    )
+    series_labels = [" · ".join(str(row[k]) for k in label_keys) or tb["name"] for _, row in catalog.iterrows()]
+    picked = st.multiselect(
+        f"Series ({len(catalog):,} in this result)", list(range(len(catalog))), default=[0],
+        format_func=lambda i: series_labels[i], key=f"treasury_pick_{request_key}",
+    )
+    if not picked:
+        return
+    filters_for = {i: {k: str(catalog.iloc[i][k]) for k in keys} for i in picked}
+    long = pd.concat([
+        treasury.series_values(df, filters_for[i], value_col, date_field).rename("value").rename_axis("Date")
+        .reset_index().assign(series=series_labels[i])
+        for i in picked
+    ])
+    fig = px.line(long.dropna(), x="Date", y="value", color="series", markers=len(long) <= 60)
+    fig.update_layout(height=420, margin=dict(l=40, r=20, t=30, b=40), legend_title_text=None,
+                      legend=dict(orientation="h", yanchor="top", y=-0.15), yaxis_title=labels.get(value_col))
+    st.plotly_chart(fig, use_container_width=True, key=f"treasury_chart_{request_key}")
+
+    if st.button("Add to the Time Series and Relationship tabs", key=f"treasury_add_{request_key}"):
+        added = []
+        for i in picked:
+            label = f"{tb['name']}: {labels.get(value_col, value_col)}"
+            if keys:
+                label += f" ({series_labels[i]})"
+            spec = {
+                "query": (tb["endpoint"], fields, date_field, filter_field, values), "filters": filters_for[i],
+                "value_col": value_col, "label": label,
+            }
+            sid = f"{treasury.TREASURY_PREFIX}{slugify(series_labels[i] if keys else tb['name'])[:32]}_{zlib.crc32(repr(spec).encode()) & 0xFFFF:04X}"
+            get_treasury_series()[sid] = spec
+            added.append(sid)
+        st.session_state["ts_treasury_series"] = list(
+            dict.fromkeys(st.session_state.get("ts_treasury_series", []) + added)
+        )
+        st.success(
+            "Added and selected in the Time Series sidebar (under **Treasury series**). In the "
+            "Relationship tab or a derived series, use the ID: " + ", ".join(f"`{s}`" for s in added)
+        )
+
+
+tab_series, tab_relationship, tab_nyfed, tab_bea, tab_census, tab_bls, tab_treasury = st.tabs(
+    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA", "Census", "BLS", "Treasury"]
 )
+
+# --- Treasury tab ----------------------------------------------------------
+# Rendered before the Time Series tab so a series added here is selectable there on the same run.
+
+with tab_treasury:
+    st.write(
+        "Explore the U.S. Treasury's [Fiscal Data API](https://fiscaldata.treasury.gov/api-documentation/): "
+        "Debt to the Penny, the Daily and Monthly Treasury Statements, average interest rates, exchange "
+        "rates, auctions, savings bonds and more — every dataset and table Fiscal Data publishes. No key "
+        "needed. Series can be added to the Time Series and Relationship tabs alongside the other sources."
+    )
+    try:
+        treasury_request = treasury_request_controls()
+        if treasury_request and st.button("Get data", type="primary", key="treasury_get"):
+            st.session_state["treasury_request"] = treasury_request
+            st.session_state.pop("treasury_error", None)
+        saved = st.session_state.get("treasury_request")
+        if saved and treasury_request and saved[0]["endpoint"] == treasury_request[0]["endpoint"]:
+            try:
+                render_treasury_table(*saved)
+            except (treasury.TreasuryError, requests.RequestException) as e:
+                st.session_state.pop("treasury_request")
+                st.session_state["treasury_error"] = (saved[0]["endpoint"], str(e))
+        error = st.session_state.get("treasury_error")
+        if error and treasury_request and error[0] == treasury_request[0]["endpoint"]:
+            st.error(f"Treasury request failed: {error[1]}")
+    except (treasury.TreasuryError, requests.RequestException) as e:
+        st.error(f"Couldn't load the Fiscal Data catalog: {e}")
+    except Exception as e:  # an unexpected response shape shouldn't take down the other tabs
+        st.error(f"Couldn't display this Treasury data ({type(e).__name__}: {e}).")
+    st.caption("Data: U.S. Department of the Treasury, Bureau of the Fiscal Service (Fiscal Data).")
 
 # --- BLS tab ---------------------------------------------------------------
 # Rendered before the Time Series tab so a series added here is selectable there on the same run.
@@ -1905,9 +2101,18 @@ with tab_series:
             )
             st.caption("Any BLS series ID also works typed as `BLS:<series ID>`, e.g. `BLS:LNS14000000`.")
 
+        treasury_defs = get_treasury_series()
+        with st.expander("Treasury series", expanded=bool(st.session_state.get("ts_treasury_series"))):
+            treasury_chosen = st.multiselect(
+                "Series added from the Treasury tab", options=list(treasury_defs),
+                format_func=lambda sid: treasury_defs[sid]["label"], key="ts_treasury_series",
+            )
+            if not treasury_defs:
+                st.caption("Fetch a table in the **Treasury** tab, then add series from it to chart them here.")
+
         series_ids = tuple(dict.fromkeys(  # dedupe, keep order
             chosen_labels + nyfed_chosen + [nyfed.PD_PREFIX + k for k in pd_chosen] + bea_chosen
-            + census_chosen + bls_chosen + custom_ids
+            + census_chosen + bls_chosen + treasury_chosen + custom_ids
         ))
 
         if series_ids:
