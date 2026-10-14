@@ -31,6 +31,7 @@ from fred_data import FredDatasets, get_api_key, get_recession_series, shade_rec
 import nyfed_data as nyfed
 import bea_data as bea
 import census_data as census
+import bls_data as bls
 
 st.set_page_config(page_title="FREDDIE, BEAtrice & ADLER", layout="wide")
 
@@ -135,6 +136,8 @@ def base_label(sid: str) -> str:
         return get_bea_series()[sid]["label"]
     if sid in get_census_series():
         return get_census_series()[sid]["label"]
+    if bls.is_bls_id(sid):
+        return st.session_state.get("bls_titles", {}).get(sid[len(bls.BLS_PREFIX):]) or f"BLS {sid[len(bls.BLS_PREFIX):]}"
     return DEFAULT_SERIES.get(sid) or nyfed.nyfed_label(sid) or sid
 
 
@@ -223,13 +226,48 @@ def census_table(path: str, get_vars: tuple, predicates: tuple, numeric: tuple, 
     return census.get_data(path, list(get_vars), dict(predicates), _key, set(numeric), set(geo))
 
 
+# BLS allows only 25 unregistered requests a day (500 with a key), so results are kept for hours.
+@st.cache_data(ttl=6 * 3600, show_spinner="Fetching from BLS...")
+def fetch_bls(series_ids: tuple[str, ...], start_year: int, end_year: int, has_key: bool, _key: str | None):
+    return bls.fetch(list(series_ids), start_year, end_year, _key)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def bls_surveys() -> dict[str, str]:
+    return bls.surveys()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def bls_popular(survey: str | None) -> list[str]:
+    return bls.popular(survey)
+
+
+def bls_fetch_with_titles(series_ids: tuple[str, ...], start_year: int, end_year: int):
+    """fetch_bls, remembering any series titles BLS returned so labels can use them."""
+    key = bls.get_bls_key()
+    data, titles, notes = fetch_bls(series_ids, start_year, end_year, bool(key), key)
+    st.session_state.setdefault("bls_titles", {}).update(titles)
+    return data, notes
+
+
 def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
     """Base series side by side: FRED IDs from FRED, `NYFED:` IDs from the NY Fed Markets API,
-    `BEA:` IDs from BEA, `CENSUS:` IDs from the Census Bureau."""
+    `BEA:` IDs from BEA, `CENSUS:` IDs from the Census Bureau, `BLS:` IDs from BLS."""
     fred_ids = tuple(
-        s for s in series_ids if not (nyfed.is_nyfed_id(s) or bea.is_bea_id(s) or census.is_census_id(s))
+        s for s in series_ids
+        if not (nyfed.is_nyfed_id(s) or bea.is_bea_id(s) or census.is_census_id(s) or bls.is_bls_id(s))
     )
     frames = [fetch(fred_ids, start, end, get_api_key())] if fred_ids else []
+    bls_ids = tuple(s for s in series_ids if bls.is_bls_id(s))
+    if bls_ids:
+        try:
+            data, _ = bls_fetch_with_titles(
+                tuple(s[len(bls.BLS_PREFIX):] for s in bls_ids), int(start[:4]), int(end[:4])
+            )
+        except (bls.BLSError, requests.RequestException) as e:
+            raise ValueError(f"Couldn't fetch {', '.join(bls_ids)} from BLS: {e}") from e
+        for sid in bls_ids:
+            frames.append(data[sid[len(bls.BLS_PREFIX):]].loc[start:end].rename(base_label(sid)))
     for sid in series_ids:
         if nyfed.is_nyfed_id(sid):
             try:
@@ -305,10 +343,18 @@ def rename_control(sid: str):
         st.caption(f"Display name: **{series_display_label(sid)}** (rename it where it's first configured)")
         return
     _rendered_rename_sids.add(sid)
+    auto = auto_series_label(sid)
+    label_key, seen_key = f"custom_label_{sid}", f"custom_label_seen_default_{sid}"
+    seen = st.session_state.get(seen_key)
+    # The box starts out holding the default name; while the user hasn't edited it, follow the
+    # default if it changes (e.g. a BLS series' title arriving after its first fetch).
+    if seen is not None and auto != seen and st.session_state.get(label_key) == seen:
+        st.session_state[label_key] = auto
+    st.session_state[seen_key] = auto
     st.text_input(
         f"Display name for {sid}",
-        value=st.session_state.get(f"custom_label_{sid}", auto_series_label(sid)),
-        key=f"custom_label_{sid}",
+        value=st.session_state.get(label_key, auto),
+        key=label_key,
     )
 
 
@@ -1541,9 +1587,133 @@ def render_census_table(path: str, get_vars: tuple, predicates: tuple, numeric: 
         )
 
 
-tab_series, tab_relationship, tab_nyfed, tab_bea, tab_census = st.tabs(
-    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA", "Census"]
+def bls_request_controls(key: str | None) -> tuple | None:
+    """Inputs for a BLS request. Returns (series IDs, start year, end year) or None."""
+    try:
+        survey_names = bls_surveys()
+        survey = st.selectbox(
+            "Browse popular series in a survey", [None] + list(survey_names), key="bls_survey",
+            format_func=lambda s: "All surveys (most popular overall)" if s is None else f"{s} — {survey_names[s]}",
+        )
+        popular_ids = bls_popular(survey)
+    except (bls.BLSError, requests.RequestException) as e:
+        st.warning(f"Couldn't load BLS's survey and popular-series lists: {e}")
+        popular_ids = []
+    # Options are shown by series ID only: pickers remember choices by their displayed text, which
+    # would change (and drop the choice) once BLS returns titles.
+    picked = st.multiselect(
+        "Series (titles appear in the results)", popular_ids, default=popular_ids[:1], key=f"bls_pick_{survey}",
+    )
+    typed = st.text_input(
+        "Other series IDs (comma-separated)", key="bls_typed",
+        help="Any BLS series ID, e.g. LNS14000000 (unemployment rate) or CUUR0000SA0 (CPI-U). Find IDs with "
+             "BLS's data finder: https://www.bls.gov/data/",
+    )
+    this_year = datetime.date.today().year
+    start_year, end_year = st.slider(
+        "Years", min_value=1913, max_value=this_year, value=(this_year - 9, this_year), key="bls_years",
+    )
+    typed_ids = [t.strip().upper() for t in typed.split(",") if t.strip()]
+    bad = [t for t in typed_ids if not bls.SERIES_ID_RE.match(t)]
+    if bad:
+        st.warning("Not valid BLS series IDs: " + ", ".join(bad))
+        return None
+    series_ids = list(dict.fromkeys(picked + typed_ids))
+    if not series_ids:
+        st.caption("Pick or type at least one series.")
+        return None
+    max_years, max_series = bls.limits(key)
+    n_requests = -(-(end_year - start_year + 1) // max_years) * -(-len(series_ids) // max_series)
+    if n_requests > 1:
+        allowance = "500" if key else "25"
+        st.caption(
+            f"This takes {n_requests} BLS requests (up to {max_years} years and {max_series} series each; "
+            f"{allowance} requests a day allowed{'' if key else ' without a key'})."
+        )
+    return tuple(series_ids), start_year, end_year
+
+
+def render_bls_result(series_ids: tuple, start_year: int, end_year: int):
+    data, notes = bls_fetch_with_titles(series_ids, start_year, end_year)
+    titles = st.session_state.get("bls_titles", {})
+    for note in notes:
+        st.caption(f"BLS: {note}")
+    empty = [s for s in series_ids if data[s].empty]
+    if empty:
+        st.warning("No data for: " + ", ".join(empty) + " (check the series IDs and years).")
+    found = [s for s in series_ids if not data[s].empty]
+    if not found:
+        return
+    label = {s: f"{s} — {titles[s]}" if s in titles else s for s in found}
+    wide = pd.concat({label[s]: data[s] for s in found}, axis=1, sort=True)
+    wide.index.name = "Date"
+    request_key = f"{zlib.crc32(repr((series_ids, start_year, end_year)).encode())}"
+    st.dataframe(wide, use_container_width=True, height=320,
+                 column_config={"Date": st.column_config.DateColumn("Date")})
+    st.download_button(
+        "Download as CSV", wide.to_csv().encode("utf-8"), file_name="bls_series.csv", mime="text/csv",
+        key=f"bls_csv_{request_key}",
+    )
+    long = wide.reset_index().melt(id_vars="Date", var_name="series", value_name="value").dropna()
+    fig = px.line(long, x="Date", y="value", color="series", markers=len(wide) <= 40)
+    fig.update_layout(height=420, margin=dict(l=40, r=20, t=30, b=40), legend_title_text=None,
+                      legend=dict(orientation="h", yanchor="top", y=-0.15))
+    st.plotly_chart(fig, use_container_width=True, key=f"bls_chart_{request_key}")
+
+    if st.button("Add to the Time Series and Relationship tabs", key=f"bls_add_{request_key}"):
+        added = [bls.BLS_PREFIX + s for s in found]
+        st.session_state["bls_added"] = list(dict.fromkeys(st.session_state.get("bls_added", []) + added))
+        st.session_state["ts_bls_series"] = list(dict.fromkeys(st.session_state.get("ts_bls_series", []) + added))
+        st.success(
+            "Added and selected in the Time Series sidebar (under **BLS series**). Elsewhere, use the ID: "
+            + ", ".join(f"`{s}`" for s in added)
+        )
+
+
+tab_series, tab_relationship, tab_nyfed, tab_bea, tab_census, tab_bls = st.tabs(
+    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA", "Census", "BLS"]
 )
+
+# --- BLS tab ---------------------------------------------------------------
+# Rendered before the Time Series tab so a series added here is selectable there on the same run.
+
+with tab_bls:
+    st.write(
+        "Pull any series from the Bureau of Labor Statistics' [Public Data API]"
+        "(https://www.bls.gov/developers/api_signature_v2.htm): CPI and PPI, employment and payrolls, "
+        "unemployment (national, state and local), wages, productivity, JOLTS and more. Browse each "
+        "survey's most popular series or type any series ID, and add them to the Time Series and "
+        "Relationship tabs alongside FRED, NY Fed, BEA and Census data."
+    )
+    bls_key = bls.get_bls_key()
+    if not bls_key:
+        st.info(
+            "No BLS key is configured, so requests are limited to 10 years and 25 series each, 25 a day "
+            "(shared by everyone using this app), without series titles. Register for a free key at "
+            "https://data.bls.gov/registrationEngine/ and add it as `BLS_API_KEY` in the app's Streamlit "
+            "secrets, or run `python setup_api_key.py --bls` when running locally."
+        )
+    try:
+        bls_request = bls_request_controls(bls_key)
+        if bls_request and st.button("Get data", type="primary", key="bls_get"):
+            st.session_state["bls_request"] = bls_request
+            st.session_state.pop("bls_error", None)
+        saved = st.session_state.get("bls_request")
+        if saved:
+            try:
+                render_bls_result(*saved)
+            except (bls.BLSError, requests.RequestException) as e:
+                # Forget a failed request so reruns don't spend more of BLS's daily allowance on it.
+                st.session_state.pop("bls_request")
+                st.session_state["bls_error"] = str(e)
+        if st.session_state.get("bls_error"):
+            st.error(f"BLS request failed: {st.session_state['bls_error']}")
+    except Exception as e:  # an unexpected response shape shouldn't take down the other tabs
+        st.error(f"Couldn't display this BLS data ({type(e).__name__}: {e}).")
+    st.caption(
+        "BLS.gov cannot vouch for the data or analyses derived from these data after the data have been "
+        "retrieved from BLS.gov."
+    )
 
 # --- Census tab ------------------------------------------------------------
 # Rendered before the Time Series tab so a series added here is selectable there on the same run.
@@ -1723,9 +1893,21 @@ with tab_series:
             if not census_defs:
                 st.caption("Fetch a time series in the **Census** tab, then add series from it to chart them here.")
 
+        with st.expander("BLS series", expanded=bool(st.session_state.get("ts_bls_series"))):
+            try:
+                bls_options = [bls.BLS_PREFIX + s for s in bls_popular(None)]
+            except (bls.BLSError, requests.RequestException):
+                bls_options = []
+            bls_options = list(dict.fromkeys(st.session_state.get("bls_added", []) + bls_options))
+            bls_chosen = st.multiselect(  # shown by series ID: titles arriving later would drop choices
+                "Popular BLS series, plus any added from the BLS tab", options=bls_options,
+                format_func=lambda sid: sid[len(bls.BLS_PREFIX):], key="ts_bls_series",
+            )
+            st.caption("Any BLS series ID also works typed as `BLS:<series ID>`, e.g. `BLS:LNS14000000`.")
+
         series_ids = tuple(dict.fromkeys(  # dedupe, keep order
             chosen_labels + nyfed_chosen + [nyfed.PD_PREFIX + k for k in pd_chosen] + bea_chosen
-            + census_chosen + custom_ids
+            + census_chosen + bls_chosen + custom_ids
         ))
 
         if series_ids:

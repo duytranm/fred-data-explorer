@@ -22,6 +22,10 @@ An interactive Streamlit app for pulling data from [FRED](https://fred.stlouisfe
   - The **Census** tab searches all ~850 aggregate and time-series datasets (ACS, decennial census, County Business Patterns, economic indicators, international trade, QWI and more; microdata optional). It picks tables and variables, geography levels and time ranges, pre-filled from Census's own example query for each dataset.
   - Time series can be added to the Time Series and Relationship tabs; cross-sections (e.g. one ACS year by state) are shown as a ranked bar chart.
   - Browsing works without a key; fetching data needs `CENSUS_API_KEY` in Streamlit secrets or an env var, or locally `python setup_api_key.py --census`.
+- Bureau of Labor Statistics [Public Data API v2](https://www.bls.gov/developers/api_signature_v2.htm) (free key: [data.bls.gov/registrationEngine](https://data.bls.gov/registrationEngine/)):
+  - The **BLS** tab browses each survey's most popular series or takes any series IDs, over a year-range slider, splitting long ranges into as many requests as BLS's limits need.
+  - BLS series chart alongside everything else as `BLS:<series ID>` (e.g. `BLS:LNS14000000`), from the **BLS series** sidebar picker or typed anywhere a series ID is accepted.
+  - Works without a key, but only 25 requests a day (shared by everyone using a deployed app), 10 years per request and no series titles. `BLS_API_KEY` in Streamlit secrets or an env var (or locally `python setup_api_key.py --bls`) raises that to 500 a day and 20 years, with titles.
 
 ## Two ways to run this
 
@@ -73,8 +77,9 @@ Share a live link with anyone — no install on their end.
    FRED_API_KEY = "your_fred_api_key_here"
    BEA_API_KEY = "your_bea_api_key_here"
    CENSUS_API_KEY = "your_census_api_key_here"
+   BLS_API_KEY = "your_bls_api_key_here"
    ```
-   (free keys: [FRED](https://fred.stlouisfed.org/docs/api/api_key.html), [BEA](https://apps.bea.gov/API/signup/), [Census](https://api.census.gov/data/key_signup.html)). Without `FRED_API_KEY`, FRED series won't load; without `BEA_API_KEY`, the BEA tab is unavailable; without `CENSUS_API_KEY`, the Census tab can browse but not fetch data. NY Fed data needs no key.
+   (free keys: [FRED](https://fred.stlouisfed.org/docs/api/api_key.html), [BEA](https://apps.bea.gov/API/signup/), [Census](https://api.census.gov/data/key_signup.html)). Without `FRED_API_KEY`, FRED series won't load; without `BEA_API_KEY`, the BEA tab is unavailable; without `CENSUS_API_KEY`, the Census tab can browse but not fetch data; without `BLS_API_KEY`, BLS data is limited to 25 requests a day. NY Fed data needs no key.
 5. Click **Deploy**. The app reads the keys from Streamlit's secrets automatically — `keyring`/Windows Credential Manager isn't available on Cloud, and the app already falls back past it.
 
 To test the secrets path locally first: copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, fill in your keys (that file is gitignored, so it never gets pushed), then `streamlit run app.py`.
@@ -94,7 +99,8 @@ To test the secrets path locally first: copy `.streamlit/secrets.toml.example` t
 | `nyfed_data.py` | New York Fed Markets Data API client (charted `NYFED:` series, response-to-table flattening) |
 | `bea_data.py` | BEA API helpers on top of `beaapi` (key lookup, parameter metadata, period parsing, series extraction) |
 | `census_data.py` | Census Data API client (dataset catalog, variables, geography, queries, time parsing) |
-| `setup_api_key.py` | One-time CLI to store your FRED API key (or your BEA / Census key, with `--bea` / `--census`) |
+| `bls_data.py` | BLS Public Data API v2 client (surveys, popular series, chunked data requests, period parsing) |
+| `setup_api_key.py` | One-time CLI to store your FRED API key (or your BEA / Census / BLS key, with `--bea` / `--census` / `--bls`) |
 | `requirements.txt` | Python dependencies |
 | `.streamlit/config.toml` | Light theme configuration |
 | `run.bat` / `run.sh` | One-click local launcher: sets up everything and starts the app |

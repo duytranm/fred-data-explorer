@@ -7,12 +7,13 @@ Get free keys first:
     FRED:   https://fredapi.stlouisfed.org/docs/api/api_key.html
     BEA:    https://apps.bea.gov/API/signup/
     Census: https://api.census.gov/data/key_signup.html
+    BLS:    https://data.bls.gov/registrationEngine/
 
 Usage:
     python setup_api_key.py            # prompts and saves a FRED key
     python setup_api_key.py --check    # shows whether a FRED key is currently stored
     python setup_api_key.py --remove   # deletes the stored FRED key
-    Add --bea or --census to any of these to manage that key instead, e.g. `python setup_api_key.py --census`.
+    Add --bea, --census or --bls to any of these to manage that key instead, e.g. `python setup_api_key.py --bls`.
 """
 
 import sys
@@ -23,8 +24,9 @@ SERVICES = {
     "FRED": ("fred_api", "api_key"),
     "BEA": ("bea_api", "api_key"),
     "Census": ("census_api", "api_key"),
+    "BLS": ("bls_api", "api_key"),
 }
-FLAGS = {"--bea": "BEA", "--census": "Census"}
+FLAGS = {"--bea": "BEA", "--census": "Census", "--bls": "BLS"}
 
 
 def save_key(name: str):
