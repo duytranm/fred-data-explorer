@@ -105,7 +105,7 @@ TRANSFORM_OPS = {
 st.title("FREDDIE, BEAtrice & ADLER")
 st.caption(
     "FRED Data Insights Explorer, BEA Tabulated Relevant Information Concerning Economics & "
-    "All Data-Loaded Economic Resources, or FBA for Full-Batch Analytics"
+    "All Data-Loaded Economic Resources (aka FBA for Full-Batch Analytics)"
 )
 
 if not get_api_key():
