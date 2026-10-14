@@ -4,14 +4,15 @@ One-time setup: store your FRED (or BEA) API key securely in the OS credential s
 without an environment variable in every session.
 
 Get free keys first:
-    FRED: https://fredapi.stlouisfed.org/docs/api/api_key.html
-    BEA:  https://apps.bea.gov/API/signup/
+    FRED:   https://fredapi.stlouisfed.org/docs/api/api_key.html
+    BEA:    https://apps.bea.gov/API/signup/
+    Census: https://api.census.gov/data/key_signup.html
 
 Usage:
     python setup_api_key.py            # prompts and saves a FRED key
     python setup_api_key.py --check    # shows whether a FRED key is currently stored
     python setup_api_key.py --remove   # deletes the stored FRED key
-    Add --bea to any of these to manage your BEA key instead, e.g. `python setup_api_key.py --bea`.
+    Add --bea or --census to any of these to manage that key instead, e.g. `python setup_api_key.py --census`.
 """
 
 import sys
@@ -21,7 +22,9 @@ import keyring
 SERVICES = {
     "FRED": ("fred_api", "api_key"),
     "BEA": ("bea_api", "api_key"),
+    "Census": ("census_api", "api_key"),
 }
+FLAGS = {"--bea": "BEA", "--census": "Census"}
 
 
 def save_key(name: str):
@@ -38,7 +41,7 @@ def check_key(name: str = "FRED") -> bool:
     if key:
         print(f"A {name} key is stored (ends in ...{key[-4:]}).")
     else:
-        flag = " --bea" if name == "BEA" else ""
+        flag = next((f" {f}" for f, n in FLAGS.items() if n == name), "")
         print(f"No {name} key stored yet. Run `python setup_api_key.py{flag}` to add one.")
     return bool(key)
 
@@ -53,7 +56,7 @@ def remove_key(name: str):
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    name = "BEA" if "--bea" in args else "FRED"
+    name = next((n for f, n in FLAGS.items() if f in args), "FRED")
     if "--check" in args:
         sys.exit(0 if check_key(name) else 1)
     elif "--remove" in args:

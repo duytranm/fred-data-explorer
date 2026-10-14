@@ -18,6 +18,10 @@ An interactive Streamlit app for pulling data from [FRED](https://fred.stlouisfe
   - The **BEA** tab covers every BEA API dataset (NIPA, GDP by industry, Regional, ITA, IIP, Input-Output, MNE and more), with parameter choices loaded from BEA's metadata.
   - Chart any series from a fetched table, then add it to the Time Series and Relationship tabs to combine it with FRED and NY Fed data.
   - Provide the key as `BEA_API_KEY` in Streamlit secrets or an env var, or locally with `python setup_api_key.py --bea`.
+- U.S. Census Bureau [Data API](https://www.census.gov/data/developers/data-sets.html) (free key: [api.census.gov/data/key_signup.html](https://api.census.gov/data/key_signup.html)):
+  - The **Census** tab searches all ~850 aggregate and time-series datasets (ACS, decennial census, County Business Patterns, economic indicators, international trade, QWI and more; microdata optional). It picks tables and variables, geography levels and time ranges, pre-filled from Census's own example query for each dataset.
+  - Time series can be added to the Time Series and Relationship tabs; cross-sections (e.g. one ACS year by state) are shown as a ranked bar chart.
+  - Browsing works without a key; fetching data needs `CENSUS_API_KEY` in Streamlit secrets or an env var, or locally `python setup_api_key.py --census`.
 
 ## Two ways to run this
 
@@ -68,8 +72,9 @@ Share a live link with anyone — no install on their end.
    ```toml
    FRED_API_KEY = "your_fred_api_key_here"
    BEA_API_KEY = "your_bea_api_key_here"
+   CENSUS_API_KEY = "your_census_api_key_here"
    ```
-   (free keys: [FRED](https://fred.stlouisfed.org/docs/api/api_key.html), [BEA](https://apps.bea.gov/API/signup/)). Without `FRED_API_KEY`, FRED series won't load; without `BEA_API_KEY`, the BEA tab is unavailable. NY Fed data needs no key.
+   (free keys: [FRED](https://fred.stlouisfed.org/docs/api/api_key.html), [BEA](https://apps.bea.gov/API/signup/), [Census](https://api.census.gov/data/key_signup.html)). Without `FRED_API_KEY`, FRED series won't load; without `BEA_API_KEY`, the BEA tab is unavailable; without `CENSUS_API_KEY`, the Census tab can browse but not fetch data. NY Fed data needs no key.
 5. Click **Deploy**. The app reads the keys from Streamlit's secrets automatically — `keyring`/Windows Credential Manager isn't available on Cloud, and the app already falls back past it.
 
 To test the secrets path locally first: copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, fill in your keys (that file is gitignored, so it never gets pushed), then `streamlit run app.py`.
@@ -88,7 +93,8 @@ To test the secrets path locally first: copy `.streamlit/secrets.toml.example` t
 | `fred_data.py` | FRED data-fetching helpers (`FredDatasets`, recession shading, API key lookup) |
 | `nyfed_data.py` | New York Fed Markets Data API client (charted `NYFED:` series, response-to-table flattening) |
 | `bea_data.py` | BEA API helpers on top of `beaapi` (key lookup, parameter metadata, period parsing, series extraction) |
-| `setup_api_key.py` | One-time CLI to store your FRED API key (or your BEA key, with `--bea`) |
+| `census_data.py` | Census Data API client (dataset catalog, variables, geography, queries, time parsing) |
+| `setup_api_key.py` | One-time CLI to store your FRED API key (or your BEA / Census key, with `--bea` / `--census`) |
 | `requirements.txt` | Python dependencies |
 | `.streamlit/config.toml` | Light theme configuration |
 | `run.bat` / `run.sh` | One-click local launcher: sets up everything and starts the app |

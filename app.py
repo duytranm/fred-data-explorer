@@ -30,6 +30,7 @@ import matplotlib.dates as mdates
 from fred_data import FredDatasets, get_api_key, get_recession_series, shade_recessions
 import nyfed_data as nyfed
 import bea_data as bea
+import census_data as census
 
 st.set_page_config(page_title="FREDDIE, BEAtrice & ADLER", layout="wide")
 
@@ -122,10 +123,18 @@ def get_bea_series() -> dict:
     return st.session_state.setdefault("bea_series", {})
 
 
+def get_census_series() -> dict:
+    """Census series added from the Census tab this session: ID -> query spec and label."""
+    return st.session_state.setdefault("census_series", {})
+
+
 def base_label(sid: str) -> str:
-    """Default name for a base series: the curated FRED label, a NY Fed or BEA series label, or the ID."""
+    """Default name for a base series: the curated FRED label, a NY Fed, BEA or Census series
+    label, or the ID."""
     if sid in get_bea_series():
         return get_bea_series()[sid]["label"]
+    if sid in get_census_series():
+        return get_census_series()[sid]["label"]
     return DEFAULT_SERIES.get(sid) or nyfed.nyfed_label(sid) or sid
 
 
@@ -178,10 +187,48 @@ def bea_table(dataset: str, params: tuple, _key: str) -> tuple[pd.DataFrame, lis
     return bea.get_table(_key, dataset, dict(params))
 
 
+@st.cache_data(ttl=86400, show_spinner="Loading the Census dataset catalog...")
+def census_catalog() -> pd.DataFrame:
+    return census.catalog()
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading Census variables...")
+def census_vars(path: str) -> dict:
+    return census.variables(path)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def census_groups(path: str) -> list[dict]:
+    return census.groups(path)
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading the table's variables...")
+def census_group_vars(path: str, group: str) -> dict:
+    return census.group_variables(path, group)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def census_geo(path: str) -> list[dict]:
+    return census.geography(path)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def census_examples(path: str) -> dict:
+    return census.examples(path)
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching from the Census Bureau...")
+def census_table(path: str, get_vars: tuple, predicates: tuple, numeric: tuple, geo: tuple, _key: str) -> pd.DataFrame:
+    """A Census query result as a typed table (see census_data.get_data)."""
+    return census.get_data(path, list(get_vars), dict(predicates), _key, set(numeric), set(geo))
+
+
 def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
     """Base series side by side: FRED IDs from FRED, `NYFED:` IDs from the NY Fed Markets API,
-    `BEA:` IDs from BEA."""
-    fred_ids = tuple(s for s in series_ids if not (nyfed.is_nyfed_id(s) or bea.is_bea_id(s)))
+    `BEA:` IDs from BEA, `CENSUS:` IDs from the Census Bureau."""
+    fred_ids = tuple(
+        s for s in series_ids if not (nyfed.is_nyfed_id(s) or bea.is_bea_id(s) or census.is_census_id(s))
+    )
     frames = [fetch(fred_ids, start, end, get_api_key())] if fred_ids else []
     for sid in series_ids:
         if nyfed.is_nyfed_id(sid):
@@ -200,6 +247,16 @@ def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFram
             except (*bea.BEAError, OSError) as e:
                 raise ValueError(f"Couldn't fetch {sid} from BEA: {e}") from e
             s = bea.series_values(table, spec["filters"]).loc[start:end]
+            frames.append(s.rename(base_label(sid)))
+        elif census.is_census_id(sid):
+            spec = get_census_series().get(sid)
+            if spec is None:
+                raise ValueError(f"{sid} isn't a Census series added in this session. Add it from the Census tab.")
+            try:
+                table = census_table(*spec["query"], census.get_census_key())
+            except (census.CensusError, requests.RequestException) as e:
+                raise ValueError(f"Couldn't fetch {sid} from the Census Bureau: {e}") from e
+            s = census.series_values(table, spec["filters"], spec["value_col"]).loc[start:end]
             frames.append(s.rename(base_label(sid)))
     return pd.concat(frames, axis=1, sort=True) if frames else pd.DataFrame()
 
@@ -1254,9 +1311,268 @@ def render_bea_table(dataset: str, params: tuple, key: str):
         )
 
 
-tab_series, tab_relationship, tab_nyfed, tab_bea = st.tabs(
-    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA"]
+def census_default_time(example_time: str | None) -> str:
+    """A recent 'from ...' range in the same granularity as the dataset's example time value
+    (e.g. '2010-Q1' -> 'from 2018-Q1', '2013-01' -> 'from 2018-01', '2012' -> 'from 2018')."""
+    this_year = datetime.date.today().year
+    m = re.match(r"^\d{4}(-Q\d|-\d{2})?", str(example_time or ""))
+    suffix = (m.group(1) or "") if m else ""
+    start, end = ("-Q1", "-Q4") if suffix.startswith("-Q") else ("-01", "-12") if suffix else ("", "")
+    # Bounded, since some datasets (e.g. QWI) reject open-ended ranges.
+    return f"from {this_year - 8}{start} to {this_year}{end}"
+
+
+def census_request_controls(key: str | None) -> tuple | None:
+    """Inputs for one Census query. Returns the census_table() arguments (path, get variables,
+    predicates, numeric variables, geography columns) or None while incomplete."""
+    cat = census_catalog()
+    if not st.toggle("Include microdata datasets", key="census_micro",
+                     help="Individual survey responses (CPS, SIPP, ACS PUMS and similar). These need "
+                          "survey weights to interpret and aren't economic time series."):
+        cat = cat[~cat["microdata"]]
+    vintage = cat["vintage"].map(lambda v: str(int(v)) if pd.notna(v) else "time series")
+    labels = dict(zip(cat["path"], cat["title"] + " — " + vintage + " (" + cat["path"] + ")"))
+    path = st.selectbox(
+        f"Dataset ({len(labels):,} available — type to search)", list(labels), index=None,
+        format_func=labels.get, placeholder="e.g. ACS 1-Year, County Business Patterns, Advance Monthly Retail Sales...",
+        key="census_dataset",
+    )
+    if not path:
+        return None
+    ex = census_examples(path)
+
+    groups = census_groups(path)
+    group = None
+    if len(groups) > 1:  # e.g. ACS: thousands of variables, organized into tables
+        group_desc = {g["name"]: g.get("description", "") for g in groups}
+        ex_group = next((v.rsplit("_", 1)[0] for v in ex.get("get", []) if v.rsplit("_", 1)[0] in group_desc), None)
+        group = st.selectbox(
+            f"Table ({len(group_desc):,})", list(group_desc),
+            index=list(group_desc).index(ex_group) if ex_group else None,
+            format_func=lambda g: f"{g} — {group_desc[g]}"[:170], placeholder="Choose a table...",
+            key=f"census_group_{path}",
+        )
+        if not group:
+            return None
+        var_meta = census.chooseable_variables(census_group_vars(path, group))
+    else:
+        var_meta = census.chooseable_variables(census_vars(path))
+
+    required = [n for n, m in var_meta.items() if str(m.get("required", "")).lower() == "true"]
+    default = [v for v in ex.get("get", []) if v in var_meta]
+    if not any(v not in ("NAME", "GEO_ID") for v in default):  # e.g. the example uses a different ACS table
+        default = (["NAME"] if "NAME" in var_meta else []) + [
+            next((n for n in var_meta if n.endswith("_001E")), next((n for n in var_meta if n not in ("NAME", "GEO_ID")), None))
+        ]
+    default = [d for d in dict.fromkeys(default + required) if d]
+    picked = st.multiselect(
+        "Variables", list(var_meta), default=default,
+        format_func=lambda n: f"{n} — {var_meta[n].get('label', '')}"[:170],
+        help="Required variables for this dataset are always included.", key=f"census_vars_{path}_{group}",
+    )
+    get_vars = list(dict.fromkeys(picked + required))
+    if not get_vars:
+        st.caption("Pick at least one variable.")
+        return None
+
+    predicates: dict[str, str] = {}
+    geo_cols: set[str] = set()
+    levels = census_geo(path)
+    if levels:
+        names = [lv["name"] for lv in levels]
+        ex_level = next((f.get("name") for f in ex.get("fips", []) if f.get("name") in names), None)
+        default_level = "state" if "state" in names else ex_level or names[0]
+        c1, c2, c3 = st.columns(3)
+        level = c1.selectbox("Geography", names, index=names.index(default_level), key=f"census_level_{path}")
+        spec = levels[names.index(level)]
+        if spec.get("wildcard") is False:  # e.g. QWI: one state at a time
+            example_value = next((f.get("exampleValue", "") for f in ex.get("fips", []) if f.get("name") == level), "")
+            which = c2.text_input(f"Which {level} (code; * isn't allowed here)", value=example_value,
+                                  key=f"census_which_{path}_{level}")
+        else:
+            which = c2.text_input(f"Which {level} (codes, or * for all)", value="*", key=f"census_which_{path}_{level}")
+        if not which.strip():
+            st.caption(f"Enter a {level} code.")
+            return None
+        predicates["for"] = f"{level}:{which.strip()}"
+        geo_cols.add(level)
+        in_parts = []
+        for parent in spec.get("requires") or []:
+            wildcard_ok = parent in (spec.get("wildcard") or [])
+            if parent == "state":
+                options = (["*"] if wildcard_ok else []) + list(census.STATE_FIPS)
+                value = c3.selectbox(
+                    "In state", options, key=f"census_in_{path}_{level}_state",
+                    format_func=lambda k: "All states" if k == "*" else f"{k} — {census.STATE_FIPS[k]}",
+                )
+            else:
+                value = c3.text_input(
+                    f"In {parent} (code{', or * for all' if wildcard_ok else ''})",
+                    value="*" if wildcard_ok else "", key=f"census_in_{path}_{level}_{parent}",
+                ).strip()
+            if not value:
+                st.caption(f"Enter a {parent} code for this geography.")
+                return None
+            in_parts.append(f"{parent}:{value}")
+            geo_cols.add(parent)
+        if in_parts:
+            predicates["in"] = " ".join(in_parts)
+
+    ex_predicates = dict(ex.get("predicates") or {})
+    c4, c5 = st.columns(2)
+    if path.startswith("timeseries/") or "time" in ex_predicates:
+        time_value = c4.text_input(
+            "Time", value=census_default_time(ex_predicates.get("time")), key=f"census_time_{path}",
+            help="A period like 2024, 2024-03 or 2024-Q1, or a range like 'from 2015' or 'from 2015 to 2020'.",
+        ).strip()
+        if time_value:
+            predicates["time"] = time_value
+    ex_predicates.pop("time", None)
+    extra = c5.text_input(
+        "Extra filters (optional)", value=urlencode(ex_predicates), key=f"census_extra_{path}",
+        help="Further predicates as name=value pairs joined by &, e.g. category_code=44X72&seasonally_adj=yes",
+    ).strip()
+    predicates.update(dict(parse_qsl(extra)))
+
+    numeric = {n for n in get_vars if var_meta.get(n, {}).get("predicateType") in ("int", "float")}
+    # Fields Census labels as codes (e.g. "2022 NAICS code") stay text even when they look numeric.
+    geo_cols |= {n for n in get_vars if re.search(r"\bcode\b", var_meta.get(n, {}).get("label", ""), re.IGNORECASE)}
+    return path, tuple(get_vars), tuple(predicates.items()), tuple(sorted(numeric - geo_cols)), tuple(sorted(geo_cols)), var_meta
+
+
+def render_census_table(path: str, get_vars: tuple, predicates: tuple, numeric: tuple, geo: tuple,
+                        var_meta: dict, key: str):
+    df = census_table(path, get_vars, predicates, numeric, geo, key)
+    st.caption(f"**{path}** · get={','.join(get_vars)} · " + " · ".join(f"{k}={v}" for k, v in predicates)
+               + f" — {len(df):,} rows")
+    if df.empty:
+        st.info("The Census API returned no rows for this query.")
+        return
+    request_key = f"{zlib.crc32(repr((path, get_vars, predicates)).encode())}"
+    st.dataframe(
+        df, use_container_width=True, height=320,
+        column_config={"Date": st.column_config.DateColumn("Date")} if "Date" in df.columns else None,
+    )
+    st.download_button(
+        "Download table as CSV", df.to_csv(index=False).encode("utf-8"),
+        file_name=f"census_{slugify(path).lower()}.csv", mime="text/csv", key=f"census_csv_{request_key}",
+    )
+
+    value_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in geo]
+    if not value_cols:
+        return
+
+    def value_label(c):
+        return f"{c} — {var_meta.get(c, {}).get('label', '')}".rstrip(" —")[:120]
+
+    st.markdown("**Chart**")
+    value_col = st.selectbox("Value", value_cols, format_func=value_label, key=f"census_value_{request_key}")
+
+    if "Date" not in df.columns or not df["Date"].notna().any():  # a cross-section, e.g. one ACS year by state
+        name_col = "NAME" if "NAME" in df.columns else next((c for c in df.columns if c not in value_cols), None)
+        top = df.dropna(subset=[value_col]).nlargest(30, value_col)
+        fig = px.bar(top, x=value_col, y=name_col, orientation="h")
+        fig.update_layout(height=max(300, 22 * len(top)), margin=dict(l=40, r=20, t=30, b=40),
+                          yaxis=dict(autorange="reversed", title=None))
+        st.plotly_chart(fig, use_container_width=True, key=f"census_bar_{request_key}")
+        st.caption(f"Top {len(top)} by {value_col}. Pick a time-series dataset to chart values over time.")
+        return
+
+    cat = census_catalog()
+    title = cat.loc[cat["path"] == path, "title"].iloc[0] if (cat["path"] == path).any() else path
+    short_title = title.rsplit(": ", 1)[-1].strip()
+    keys = census.series_key_cols(df)
+    catalog = df.drop_duplicates(keys)[keys].reset_index(drop=True) if keys else pd.DataFrame(index=[0])
+    order = ["NAME"] + [k for k in keys if k != "NAME"]
+    labels = [
+        " · ".join(str(row[k]) for k in order if k in row.index) or short_title
+        for _, row in catalog.iterrows()
+    ]
+    picked = st.multiselect(
+        f"Series ({len(catalog):,} in this result)", list(range(len(catalog))), default=[0],
+        format_func=lambda i: labels[i], key=f"census_pick_{request_key}",
+    )
+    if not picked:
+        return
+    filters_for = {i: {k: str(catalog.iloc[i][k]) for k in keys} for i in picked}
+    long = pd.concat([
+        census.series_values(df, filters_for[i], value_col).rename("value").rename_axis("Date").reset_index()
+        .assign(series=labels[i])
+        for i in picked
+    ])
+    fig = px.line(long.dropna(), x="Date", y="value", color="series", markers=len(long) <= 60)
+    fig.update_layout(height=420, margin=dict(l=40, r=20, t=30, b=40), legend_title_text=None,
+                      legend=dict(orientation="h", yanchor="top", y=-0.15))
+    st.plotly_chart(fig, use_container_width=True, key=f"census_chart_{request_key}")
+
+    if st.button("Add to the Time Series and Relationship tabs", key=f"census_add_{request_key}"):
+        added = []
+        for i in picked:
+            label = f"{short_title}: {labels[i]}" if keys else short_title
+            if len(value_cols) > 1:
+                label += f" ({value_col})"
+            spec = {
+                "query": (path, get_vars, predicates, numeric, geo), "filters": filters_for[i],
+                "value_col": value_col, "label": label,
+            }
+            sid = f"{census.CENSUS_PREFIX}{slugify(labels[i])[:32]}_{zlib.crc32(repr(spec).encode()) & 0xFFFF:04X}"
+            get_census_series()[sid] = spec
+            added.append(sid)
+        st.session_state["ts_census_series"] = list(
+            dict.fromkeys(st.session_state.get("ts_census_series", []) + added)
+        )
+        st.success(
+            "Added and selected in the Time Series sidebar (under **Census series**). In the "
+            "Relationship tab or a derived series, use the ID: " + ", ".join(f"`{s}`" for s in added)
+        )
+
+
+tab_series, tab_relationship, tab_nyfed, tab_bea, tab_census = st.tabs(
+    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA", "Census"]
 )
+
+# --- Census tab ------------------------------------------------------------
+# Rendered before the Time Series tab so a series added here is selectable there on the same run.
+
+with tab_census:
+    st.write(
+        "Query the U.S. Census Bureau's [Data API](https://www.census.gov/data/developers/data-sets.html): "
+        "the American Community Survey, decennial census, County Business Patterns, economic indicators "
+        "(retail sales, construction, trade, manufacturing...), international trade, QWI and more. Time "
+        "series can be added to the Time Series and Relationship tabs alongside FRED, NY Fed and BEA data."
+    )
+    census_key = census.get_census_key()
+    if not census_key:
+        st.info(
+            "Browsing datasets and variables works without a key, but fetching data needs a free Census "
+            "API key: request one at https://api.census.gov/data/key_signup.html, then add it as "
+            "`CENSUS_API_KEY` in the app's Streamlit secrets, or run `python setup_api_key.py --census` "
+            "when running locally."
+        )
+    try:
+        request = census_request_controls(census_key)
+        if request:
+            if st.button("Get data", type="primary", disabled=not census_key, key="census_get"):
+                st.session_state["census_request"] = request
+                st.session_state.pop("census_error", None)
+        saved = st.session_state.get("census_request")
+        if saved and request and saved[0] == request[0]:
+            try:
+                render_census_table(*saved, census_key)
+            except (census.CensusError, requests.RequestException) as e:
+                # Forget a failed request so later reruns don't resend it.
+                st.session_state.pop("census_request")
+                st.session_state["census_error"] = (saved[0], str(e))
+        error = st.session_state.get("census_error")
+        if error and request and error[0] == request[0]:
+            st.error(f"Census request failed: {error[1]}")
+    except (census.CensusError, requests.RequestException) as e:
+        st.error(f"Couldn't load Census metadata: {e}")
+    except Exception as e:  # an unexpected response shape shouldn't take down the other tabs
+        st.error(f"Couldn't display this Census data ({type(e).__name__}: {e}).")
+    st.caption(
+        "This product uses the Census Bureau Data API but is not endorsed or certified by the Census Bureau."
+    )
 
 # --- BEA tab ---------------------------------------------------------------
 # Rendered before the Time Series tab so a series added here is selectable there on the same run.
@@ -1384,8 +1700,18 @@ with tab_series:
             if not bea_defs:
                 st.caption("Fetch a table in the **BEA** tab, then add series from it to chart them here.")
 
+        census_defs = get_census_series()
+        with st.expander("Census series", expanded=bool(st.session_state.get("ts_census_series"))):
+            census_chosen = st.multiselect(
+                "Series added from the Census tab", options=list(census_defs),
+                format_func=lambda sid: census_defs[sid]["label"], key="ts_census_series",
+            )
+            if not census_defs:
+                st.caption("Fetch a time series in the **Census** tab, then add series from it to chart them here.")
+
         series_ids = tuple(dict.fromkeys(  # dedupe, keep order
-            chosen_labels + nyfed_chosen + [nyfed.PD_PREFIX + k for k in pd_chosen] + bea_chosen + custom_ids
+            chosen_labels + nyfed_chosen + [nyfed.PD_PREFIX + k for k in pd_chosen] + bea_chosen
+            + census_chosen + custom_ids
         ))
 
         if series_ids:
