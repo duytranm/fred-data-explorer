@@ -104,48 +104,12 @@ TRANSFORM_OPS = {
 
 st.title("FRED Data Insights Explorer")
 
-with st.sidebar:
-    st.text_input(
-        "Your own FRED API key (optional)",
-        type="password",
-        key="user_api_key",
-        help=(
-            "Paste your own free FRED API key to use it for this session instead of the "
-            "key this app is configured with. Get one at "
-            "https://fred.stlouisfed.org/docs/api/api_key.html"
-        ),
-    )
-    st.text_input(
-        "Your own BEA API key (optional)",
-        type="password",
-        key="user_bea_key",
-        help=(
-            "Paste your own free Bureau of Economic Analysis key to use BEA data in this session "
-            "instead of the key this app is configured with. Get one at https://apps.bea.gov/API/signup/"
-        ),
-    )
-    st.divider()
-
-
-def resolve_api_key() -> str | None:
-    """The key to actually use: one typed into the sidebar for this session, else the
-    app's own configured key (Streamlit secrets / env var / local keyring)."""
-    typed = st.session_state.get("user_api_key", "").strip()
-    return typed or get_api_key()
-
-
-def resolve_bea_key() -> str | None:
-    """Like resolve_api_key, for the BEA key (sidebar, then secrets / env var / keyring)."""
-    typed = st.session_state.get("user_bea_key", "").strip()
-    return typed or bea.get_bea_key()
-
-
-if not resolve_api_key():
+if not get_api_key():
     st.warning(
-        "No FRED API key found, so FRED series won't load. Paste your own free key in the sidebar "
-        "(get one at https://fred.stlouisfed.org/docs/api/api_key.html), or, if you're running this "
-        "locally, run `python setup_api_key.py` in this folder once and reload. The **NY Fed Markets** "
-        "tab and `NYFED:` series work without a key."
+        "No FRED API key is configured, so FRED series won't load. Add `FRED_API_KEY` to the app's "
+        "Streamlit secrets (get a free key at https://fred.stlouisfed.org/docs/api/api_key.html), or, "
+        "if you're running this locally, run `python setup_api_key.py` in this folder once and reload. "
+        "The **NY Fed Markets** tab and `NYFED:` series work without a key."
     )
 
 
@@ -214,7 +178,7 @@ def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFram
     """Base series side by side: FRED IDs from FRED, `NYFED:` IDs from the NY Fed Markets API,
     `BEA:` IDs from BEA."""
     fred_ids = tuple(s for s in series_ids if not (nyfed.is_nyfed_id(s) or bea.is_bea_id(s)))
-    frames = [fetch(fred_ids, start, end, resolve_api_key())] if fred_ids else []
+    frames = [fetch(fred_ids, start, end, get_api_key())] if fred_ids else []
     for sid in series_ids:
         if nyfed.is_nyfed_id(sid):
             try:
@@ -225,10 +189,10 @@ def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFram
             spec = get_bea_series().get(sid)
             if spec is None:
                 raise ValueError(f"{sid} isn't a BEA series added in this session. Add it from the BEA tab.")
-            if not resolve_bea_key():
-                raise ValueError("A BEA API key is needed for BEA series. Paste one in the sidebar.")
+            if not bea.get_bea_key():
+                raise ValueError("A BEA API key is needed for BEA series. Add BEA_API_KEY to the app's secrets.")
             try:
-                table, _, _ = bea_table(spec["dataset"], tuple(spec["params"].items()), resolve_bea_key())
+                table, _, _ = bea_table(spec["dataset"], tuple(spec["params"].items()), bea.get_bea_key())
             except (*bea.BEAError, OSError) as e:
                 raise ValueError(f"Couldn't fetch {sid} from BEA: {e}") from e
             s = bea.series_values(table, spec["filters"]).loc[start:end]
@@ -816,7 +780,7 @@ def publication_export_section(
         shade = st.checkbox("Shade NBER recessions", value=True, key=f"{key_prefix}_shade")
         if shade:
             try:
-                recession_series = fetch_recessions(resolve_api_key())
+                recession_series = fetch_recessions(get_api_key())
             except Exception as e:
                 st.warning(f"Couldn't load recession dates: {e}")
 
@@ -1301,12 +1265,11 @@ with tab_bea:
         "transactions and investment, input-output tables and more. Add any series to the Time Series "
         "and Relationship tabs to chart it alongside FRED and NY Fed data."
     )
-    bea_key = resolve_bea_key()
+    bea_key = bea.get_bea_key()
     if not bea_key:
         st.info(
             "BEA data needs a free API key. Sign up at https://apps.bea.gov/API/signup/ (BEA emails the "
-            "key to you), then paste it into **Your own BEA API key** in the sidebar. To set one for the "
-            "whole app, add `BEA_API_KEY` to the app's Streamlit secrets, or run "
+            "key to you), then add it as `BEA_API_KEY` in the app's Streamlit secrets, or run "
             "`python setup_api_key.py --bea` when running locally."
         )
     else:

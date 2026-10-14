@@ -17,7 +17,7 @@ An interactive Streamlit app for pulling data from [FRED](https://fred.stlouisfe
 - Bureau of Economic Analysis data via BEA's official [`beaapi`](https://github.com/us-bea/beaapi) library (free key: [apps.bea.gov/API/signup](https://apps.bea.gov/API/signup/)):
   - The **BEA** tab covers every BEA API dataset (NIPA, GDP by industry, Regional, ITA, IIP, Input-Output, MNE and more), with parameter choices loaded from BEA's metadata.
   - Chart any series from a fetched table, then add it to the Time Series and Relationship tabs to combine it with FRED and NY Fed data.
-  - Provide the key in the sidebar, as `BEA_API_KEY` in Streamlit secrets or an env var, or locally with `python setup_api_key.py --bea`.
+  - Provide the key as `BEA_API_KEY` in Streamlit secrets or an env var, or locally with `python setup_api_key.py --bea`.
 
 ## Two ways to run this
 
@@ -64,16 +64,15 @@ Share a live link with anyone — no install on their end.
 1. Push this folder to a GitHub repo (public or private).
 2. Go to [share.streamlit.io](https://share.streamlit.io), sign in with GitHub, and click **New app**.
 3. Pick the repo/branch and set the main file path to `app.py`.
-4. (Optional) Before deploying, open **Advanced settings → Secrets** and paste:
+4. Before deploying, open **Advanced settings → Secrets** and paste:
    ```toml
    FRED_API_KEY = "your_fred_api_key_here"
+   BEA_API_KEY = "your_bea_api_key_here"
    ```
-   (get a free key at [fred.stlouisfed.org/docs/api/api_key.html](https://fred.stlouisfed.org/docs/api/api_key.html) if you don't have one)
-5. Click **Deploy**. The app reads the key from Streamlit's secrets automatically — `keyring`/Windows Credential Manager isn't available on Cloud, and the app already falls back past it.
+   (free keys: [FRED](https://fred.stlouisfed.org/docs/api/api_key.html), [BEA](https://apps.bea.gov/API/signup/)). Without `FRED_API_KEY`, FRED series won't load; without `BEA_API_KEY`, the BEA tab is unavailable. NY Fed data needs no key.
+5. Click **Deploy**. The app reads the keys from Streamlit's secrets automatically — `keyring`/Windows Credential Manager isn't available on Cloud, and the app already falls back past it.
 
-Setting a secret is optional: the app also has a "Your own FRED API key" field at the top of its sidebar, so anyone using the deployed app can paste their own free key for their session instead of relying on yours. Configuring the secret just means the app works out of the box without visitors needing their own key.
-
-To test the secrets path locally first: copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, fill in your key (that file is gitignored, so it never gets pushed), then `streamlit run app.py`.
+To test the secrets path locally first: copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, fill in your keys (that file is gitignored, so it never gets pushed), then `streamlit run app.py`.
 
 ## Troubleshooting
 
