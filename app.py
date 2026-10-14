@@ -103,6 +103,11 @@ TRANSFORM_OPS = {
 }
 
 st.title("FREDDIE, BEAtrice & ADLER")
+st.subheader(
+    "FRED Data Insights Explorer, BEA Tabulated Relevant Information Concerning Economics & "
+    "All Data-Loaded Economic Resources, or FBA for Full-Batch Analytics",
+    anchor=False,
+)
 
 if not get_api_key():
     st.warning(
