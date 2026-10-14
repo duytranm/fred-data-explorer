@@ -31,7 +31,7 @@ from fred_data import FredDatasets, get_api_key, get_recession_series, shade_rec
 import nyfed_data as nyfed
 import bea_data as bea
 
-st.set_page_config(page_title="FRED Data Insights Explorer", layout="wide")
+st.set_page_config(page_title="FREDDIE, BEAtrice & ADLER", layout="wide")
 
 DEFAULT_PALETTE = px.colors.qualitative.Plotly  # cycled through when picking default line colors
 IMAGE_FORMATS = {"PNG": "image/png", "JPEG": "image/jpeg", "SVG": "image/svg+xml", "PDF": "application/pdf"}
@@ -102,7 +102,7 @@ TRANSFORM_OPS = {
     "Invert (1 / x)": (lambda s, p: 1 / s, None, 0),
 }
 
-st.title("FRED Data Insights Explorer")
+st.title("FREDDIE, BEAtrice & ADLER")
 
 if not get_api_key():
     st.warning(
