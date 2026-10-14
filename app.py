@@ -1311,15 +1311,27 @@ def render_bea_table(dataset: str, params: tuple, key: str):
         )
 
 
-def census_default_time(example_time: str | None) -> str:
-    """A recent 'from ...' range in the same granularity as the dataset's example time value
-    (e.g. '2010-Q1' -> 'from 2018-Q1', '2013-01' -> 'from 2018-01', '2012' -> 'from 2018')."""
-    this_year = datetime.date.today().year
-    m = re.match(r"^\d{4}(-Q\d|-\d{2})?", str(example_time or ""))
-    suffix = (m.group(1) or "") if m else ""
-    start, end = ("-Q1", "-Q4") if suffix.startswith("-Q") else ("-01", "-12") if suffix else ("", "")
-    # Bounded, since some datasets (e.g. QWI) reject open-ended ranges.
-    return f"from {this_year - 8}{start} to {this_year}{end}"
+@st.cache_data(ttl=86400, show_spinner=False)
+def census_time_granularity(path: str) -> str | None:
+    return census.time_granularity(path)
+
+
+def census_time_periods(granularity: str | None, example_time: str | None) -> list[str]:
+    """Selectable periods from 1950 to now, by month, quarter or year: the dataset's declared
+    time granularity, else that of its example time value ('2010-Q1', '2013-01', '2012')."""
+    today = datetime.date.today()
+    if granularity is None:
+        m = re.match(r"^\d{4}(-Q\d|-\d{2})?", str(example_time or ""))
+        suffix = (m.group(1) or "") if m else ""
+        granularity = "quarter" if suffix.startswith("-Q") else "month" if suffix else "year"
+    years = range(1950, today.year + 1)
+    if granularity == "quarter":
+        periods = [f"{y}-Q{q}" for y in years for q in range(1, 5)]
+        return periods[: len(periods) - (4 - (today.month - 1) // 3 - 1)]
+    if granularity == "month":
+        periods = [f"{y}-{mo:02d}" for y in years for mo in range(1, 13)]
+        return periods[: len(periods) - (12 - today.month)]
+    return [str(y) for y in years]
 
 
 def census_request_controls(key: str | None) -> tuple | None:
@@ -1419,16 +1431,18 @@ def census_request_controls(key: str | None) -> tuple | None:
             predicates["in"] = " ".join(in_parts)
 
     ex_predicates = dict(ex.get("predicates") or {})
-    c4, c5 = st.columns(2)
     if path.startswith("timeseries/") or "time" in ex_predicates:
-        time_value = c4.text_input(
-            "Time", value=census_default_time(ex_predicates.get("time")), key=f"census_time_{path}",
-            help="A period like 2024, 2024-03 or 2024-Q1, or a range like 'from 2015' or 'from 2015 to 2020'.",
-        ).strip()
-        if time_value:
-            predicates["time"] = time_value
+        periods = census_time_periods(census_time_granularity(path), ex_predicates.get("time"))
+        per_year = 4 if "-Q" in periods[0] else 12 if "-" in periods[0] else 1
+        start_default = periods[max(0, len(periods) - 8 * per_year)]  # the last 8 years
+        start, end = st.select_slider(
+            "Time", options=periods, value=(start_default, periods[-1]), key=f"census_time_{path}",
+            help="Periods with no data in this dataset are simply left out of the result.",
+        )
+        # Always a bounded range: some datasets (e.g. QWI) reject open-ended ones.
+        predicates["time"] = start if start == end else f"from {start} to {end}"
     ex_predicates.pop("time", None)
-    extra = c5.text_input(
+    extra = st.text_input(
         "Extra filters (optional)", value=urlencode(ex_predicates), key=f"census_extra_{path}",
         help="Further predicates as name=value pairs joined by &, e.g. category_code=44X72&seasonally_adj=yes",
     ).strip()

@@ -113,6 +113,19 @@ def has_variable(path: str, name: str) -> bool:
         return False
 
 
+def time_granularity(path: str) -> str | None:
+    """Finest period a time series accepts, from its `time` variable's metadata (e.g.
+    "{'year': True, 'month': True}"): 'month', 'quarter', 'year', or None if not given."""
+    try:
+        spec = str(_get_json(f"{BASE_URL}/{path}/variables/time.json").get("datetime", ""))
+    except CensusError:
+        return None
+    for unit in ("month", "quarter", "year"):
+        if re.search(rf"'{unit}':\s*True", spec):
+            return unit
+    return None
+
+
 def groups(path: str) -> list[dict]:
     try:
         return _get_json(f"{BASE_URL}/{path}/groups.json").get("groups", [])
