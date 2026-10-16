@@ -34,6 +34,8 @@ import census_data as census
 import bls_data as bls
 import treasury_data as treasury
 import imf_data as imf
+import oecd_data as oecd
+import sdmx_data as sdmx
 import worldbank_data as wb
 
 st.set_page_config(page_title="FREDDIE, BEAtrice & ADLER", layout="wide")
@@ -149,7 +151,9 @@ def base_label(sid: str) -> str:
     if bls.is_bls_id(sid):
         return st.session_state.get("bls_titles", {}).get(sid[len(bls.BLS_PREFIX):]) or f"BLS {sid[len(bls.BLS_PREFIX):]}"
     if imf.is_imf_id(sid):
-        return imf_label(sid)
+        return sdmx_label(sid, imf, imf_structure, lambda: imf_flows(True))
+    if oecd.is_oecd_id(sid):
+        return sdmx_label(sid, oecd, oecd_structure, oecd_flows)
     if wb.is_wb_id(sid):
         return wb_label(sid)
     return DEFAULT_SERIES.get(sid) or nyfed.nyfed_label(sid) or sid
@@ -301,16 +305,40 @@ def imf_table(agency: str, flow: str, key: str, start_year: int | None, end_year
     return imf.get_data(agency, flow, key, imf_structure(agency, flow), start_year, end_year)
 
 
-def imf_label(sid: str) -> str:
-    """e.g. 'CPI: United States · Consumer price index · All Items · Index · Monthly', from the
-    dataset's code names (the ID itself if the structure can't be loaded)."""
+# The OECD allows 60 data downloads an hour per IP and most of its datasets change once or twice
+# a year, so its results are kept for a day.
+@st.cache_data(ttl=86400, show_spinner="Loading OECD datasets...")
+def oecd_flows() -> list[dict]:
+    return oecd.dataflows()
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading the OECD dataset's structure...")
+def oecd_structure(agency: str, flow: str) -> list[dict]:
+    return oecd.structure(agency, flow)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def oecd_available(agency: str, flow: str, key: str) -> dict:
+    return oecd.available(agency, flow, key)
+
+
+@st.cache_data(ttl=86400, show_spinner="Fetching from the OECD...")
+def oecd_table(agency: str, flow: str, key: str, start_year: int | None, end_year: int | None) -> pd.DataFrame:
+    return oecd.get_data(agency, flow, key, oecd_structure(agency, flow), start_year, end_year)
+
+
+def sdmx_label(sid: str, module, structure_fn, flows_fn) -> str:
+    """e.g. 'Composite leading indicators: Japan · Monthly · Composite leading indicator (CLI) ·
+    Index · Amplitude adjusted · OECD harmonised', from the dataset's name and code names, leaving
+    out 'not applicable' (_Z) codes (the ID itself if the structure can't be loaded)."""
     try:
-        agency, flow, key = imf.parse_id(sid)
-        dims = imf_structure(agency, flow)
-    except (imf.IMFError, requests.RequestException, KeyError):
+        agency, flow, key = module.parse_id(sid)
+        dims = structure_fn(agency, flow)
+        flow_name = next((f["name"] for f in flows_fn() if f["id"] == flow and f["agency"] == agency), flow)
+    except Exception:  # any lookup failure just means a less friendly label
         return sid
-    codes = key.split(".")
-    return f"{flow}: " + " · ".join(d["codes"].get(c, c) for d, c in zip(dims, codes))
+    names = [d["codes"].get(c, c) for d, c in zip(dims, key.split(".")) if c != "_Z"]
+    return f"{flow_name}: " + " · ".join(dict.fromkeys(names))
 
 
 @st.cache_data(ttl=86400, show_spinner="Loading World Bank databases...")
@@ -353,7 +381,7 @@ def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFram
     fred_ids = tuple(
         s for s in series_ids
         if not (nyfed.is_nyfed_id(s) or bea.is_bea_id(s) or census.is_census_id(s) or bls.is_bls_id(s)
-                or treasury.is_treasury_id(s) or imf.is_imf_id(s) or wb.is_wb_id(s))
+                or treasury.is_treasury_id(s) or imf.is_imf_id(s) or oecd.is_oecd_id(s) or wb.is_wb_id(s))
     )
     frames = [fetch(fred_ids, start, end, get_api_key())] if fred_ids else []
     bls_ids = tuple(s for s in series_ids if bls.is_bls_id(s))
@@ -415,6 +443,14 @@ def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFram
             except (imf.IMFError, requests.RequestException) as e:
                 raise ValueError(f"Couldn't fetch {sid} from the IMF: {e}") from e
             s = imf.series_values(table, {}) if not table.empty else pd.Series(dtype=float, index=pd.DatetimeIndex([]))
+            frames.append(s.loc[start:end].rename(base_label(sid)))
+        elif oecd.is_oecd_id(sid):
+            try:
+                agency, flow, key = oecd.parse_id(sid)
+                table = oecd_table(agency, flow, key, int(start[:4]), int(end[:4]))
+            except (oecd.OECDError, requests.RequestException) as e:
+                raise ValueError(f"Couldn't fetch {sid} from the OECD: {e}") from e
+            s = oecd.series_values(table, {}) if not table.empty else pd.Series(dtype=float, index=pd.DatetimeIndex([]))
             frames.append(s.loc[start:end].rename(base_label(sid)))
         elif wb.is_wb_id(sid):
             try:
@@ -1921,30 +1957,24 @@ def render_treasury_table(tb: dict, start: str | None, end: str | None, filter_f
         )
 
 
-IMF_MAX_SERIES = 500  # per request; the narrowing controls show the count before fetching
-
-
-def imf_request_controls() -> tuple | None:
-    """Inputs for an IMF query. Returns (dataset, dimensions, key, start year, end year,
-    matching series count) or None."""
-    vintages = st.toggle("Include vintage snapshots", key="imf_vintages",
-                         help="Frozen past editions of datasets (e.g. a February 2026 vintage), kept for reproducibility.")
-    flows = imf_flows(vintages)
+def sdmx_request_controls(p: dict, flows: list[dict], flow_key: str) -> tuple | None:
+    """Inputs for a query against an SDMX provider (IMF or OECD; see SDMX_PROVIDERS). Returns
+    (dataset, dimensions, key, start year, end year, match count) or None."""
     names = {i: f"{f['name']} ({f['id']})" for i, f in enumerate(flows)}
-    default = next((i for i, f in enumerate(flows) if f["id"] == "CPI"), 0)
-    i = st.selectbox(f"Dataset ({len(flows)} — type to search)", list(names), index=default,
-                     format_func=names.get, key=f"imf_flow_{vintages}")
+    default = next((i for i, f in enumerate(flows) if f["id"] == p["default_flow"]), 0)
+    i = st.selectbox(f"Dataset ({len(flows):,} — type to search)", list(names), index=default,
+                     format_func=names.get, key=flow_key)
     flow = flows[i]
     if flow["description"]:
         st.caption(flow["description"][:400] + ("…" if len(flow["description"]) > 400 else ""))
-    dims = imf_structure(flow["agency"], flow["id"])
+    dims = p["structure"](flow["agency"], flow["id"])
 
     # Each dimension lists only codes that have data given the other choices, so read the
     # current choices first, ask the API what's available, then draw the pickers.
-    prefix = f"imf_{flow['agency']}_{flow['id']}"
+    prefix = f"{p['slug']}_{flow['agency']}_{flow['id']}"
     selections = {d["id"]: st.session_state.get(f"{prefix}_{d['id']}", []) for d in dims}
-    key = imf.key_string(dims, selections)
-    avail = imf_available(flow["agency"], flow["id"], key)
+    key = sdmx.key_string(dims, selections)
+    avail = p["available"](flow["agency"], flow["id"], key)
     cols = st.columns(2)
     for n, d in enumerate(dims):
         options = list(dict.fromkeys(avail["values"].get(d["id"], []) + selections[d["id"]]))
@@ -1953,14 +1983,14 @@ def imf_request_controls() -> tuple | None:
                 f"{d['name']} ({len(options):,})", options, key=f"{prefix}_{d['id']}", placeholder="All",
                 format_func=lambda c, d=d: f"{d['codes'].get(c, c)} ({c})",
             )
-    n_series = avail["series"]
+    count = avail.get(p["count_key"]) or 0
     span = f"{(avail['start'] or '')[:4]}–{(avail['end'] or '')[:4]}"
-    if n_series == 0:
-        st.warning("No series match these choices. Remove one to widen the search.")
+    if count == 0:
+        st.warning(f"No {p['count_word']} match these choices. Remove one to widen the search.")
         return None
-    st.caption(f"{n_series:,} series match · data {span}")
-    if n_series > IMF_MAX_SERIES:
-        st.info(f"Narrow the choices above to {IMF_MAX_SERIES} series or fewer to fetch data.")
+    st.caption(f"{count:,} {p['count_word']} match · data {span}")
+    if count > p["max_count"]:
+        st.info(f"Narrow the choices above to {p['max_count']:,} {p['count_word']} or fewer to fetch data.")
         return None
     try:
         lo, hi = int(avail["start"][:4]), int(avail["end"][:4])
@@ -1970,11 +2000,12 @@ def imf_request_controls() -> tuple | None:
         "Years", min_value=lo, max_value=hi, value=(max(lo, min(hi, datetime.date.today().year) - 10), hi),
         key=f"{prefix}_years",
     )
-    return flow, dims, key, y0, y1, n_series
+    return flow, dims, key, y0, y1, count
 
 
-def render_imf_result(flow: dict, dims: list[dict], key: str, y0: int, y1: int, n_series: int):
-    df = imf_table(flow["agency"], flow["id"], key, y0, y1)
+def render_sdmx_result(p: dict, flow: dict, dims: list[dict], key: str, y0: int, y1: int, count: int):
+    slug = p["slug"]
+    df = p["table"](flow["agency"], flow["id"], key, y0, y1)
     st.caption(f"**{flow['name']}** · key `{key}` · {y0}–{y1} — {len(df):,} observations")
     if df.empty:
         st.info("No observations in this range.")
@@ -1984,36 +2015,74 @@ def render_imf_result(flow: dict, dims: list[dict], key: str, y0: int, y1: int, 
                  column_config={"Date": st.column_config.DateColumn("Date")})
     st.download_button(
         "Download table as CSV", df.to_csv(index=False).encode("utf-8"),
-        file_name=f"imf_{flow['id'].lower()}.csv", mime="text/csv", key=f"imf_csv_{request_key}",
+        file_name=f"{slug}_{flow['id'].lower()}.csv", mime="text/csv", key=f"{slug}_csv_{request_key}",
     )
     dim_ids = [d["id"] for d in dims if d["id"] in df.columns]
     varying = [c for c in dim_ids if df[c].nunique() > 1]
     catalog = df.drop_duplicates(dim_ids).reset_index(drop=True)
-    labels = [imf.series_label(row, dims, varying) for _, row in catalog.iterrows()]
+    labels = [sdmx.series_label(row, dims, varying) for _, row in catalog.iterrows()]
     picked = st.multiselect(
         f"Series ({len(catalog):,} in this result)", list(range(len(catalog))), default=[0],
-        format_func=lambda i: labels[i], key=f"imf_pick_{request_key}",
+        format_func=lambda i: labels[i], key=f"{slug}_pick_{request_key}",
     )
     if not picked:
         return
     long = pd.concat([
-        imf.series_values(df, {c: catalog.iloc[i][c] for c in dim_ids}).rename("value").rename_axis("Date")
+        sdmx.series_values(df, {c: catalog.iloc[i][c] for c in dim_ids}).rename("value").rename_axis("Date")
         .reset_index().assign(series=labels[i])
         for i in picked
     ])
     fig = px.line(long.dropna(), x="Date", y="value", color="series", markers=len(long) <= 60)
     fig.update_layout(height=420, margin=dict(l=40, r=20, t=30, b=40), legend_title_text=None,
                       legend=dict(orientation="h", yanchor="top", y=-0.15))
-    st.plotly_chart(fig, use_container_width=True, key=f"imf_chart_{request_key}")
+    st.plotly_chart(fig, use_container_width=True, key=f"{slug}_chart_{request_key}")
 
-    if st.button("Add to the Time Series and Relationship tabs", key=f"imf_add_{request_key}"):
-        added = [imf.make_id(flow["agency"], flow["id"], imf.series_key(catalog.iloc[i], dims)) for i in picked]
-        st.session_state["imf_added"] = list(dict.fromkeys(st.session_state.get("imf_added", []) + added))
-        st.session_state["ts_imf_series"] = list(dict.fromkeys(st.session_state.get("ts_imf_series", []) + added))
+    if st.button("Add to the Time Series and Relationship tabs", key=f"{slug}_add_{request_key}"):
+        added = [p["make_id"](flow["agency"], flow["id"], sdmx.series_key(catalog.iloc[i], dims)) for i in picked]
+        st.session_state[f"{slug}_added"] = list(dict.fromkeys(st.session_state.get(f"{slug}_added", []) + added))
+        st.session_state[f"ts_{slug}_series"] = list(
+            dict.fromkeys(st.session_state.get(f"ts_{slug}_series", []) + added)
+        )
         st.success(
-            "Added and selected in the Time Series sidebar (under **IMF series**). Elsewhere, use the ID: "
+            f"Added and selected in the Time Series sidebar (under **{p['name']} series**). Elsewhere, use the ID: "
             + ", ".join(f"`{s}`" for s in added)
         )
+
+
+def sdmx_tab(p: dict, flows_fn, flow_key: str):
+    """The body of an SDMX provider's tab: controls, Get data, and the last result."""
+    slug = p["slug"]
+    try:
+        request = sdmx_request_controls(p, flows_fn(), flow_key)
+        if request and st.button("Get data", type="primary", key=f"{slug}_get"):
+            st.session_state[f"{slug}_request"] = request
+            st.session_state.pop(f"{slug}_error", None)
+        saved = st.session_state.get(f"{slug}_request")
+        if saved and request and saved[0]["id"] == request[0]["id"]:
+            try:
+                render_sdmx_result(p, *saved)
+            except (p["error"], requests.RequestException) as e:
+                st.session_state.pop(f"{slug}_request")
+                st.session_state[f"{slug}_error"] = (saved[0]["id"], str(e))
+        error = st.session_state.get(f"{slug}_error")
+        if error and request and error[0] == request[0]["id"]:
+            st.error(f"{p['name']} request failed: {error[1]}")
+    except (p["error"], requests.RequestException) as e:
+        st.error(f"Couldn't load {p['name']} metadata: {e}")
+    except Exception as e:  # an unexpected response shape shouldn't take down the other tabs
+        st.error(f"Couldn't display this {p['name']} data ({type(e).__name__}: {e}).")
+
+
+SDMX_PROVIDERS = {
+    # Counts: the IMF reports how many series match a selection, the OECD how many observations.
+    "imf": {"slug": "imf", "name": "IMF", "make_id": imf.make_id, "error": imf.IMFError,
+            "structure": imf_structure, "available": imf_available, "table": imf_table,
+            "count_key": "series", "count_word": "series", "max_count": 500, "default_flow": "CPI"},
+    "oecd": {"slug": "oecd", "name": "OECD", "make_id": oecd.make_id, "error": oecd.OECDError,
+             "structure": oecd_structure, "available": oecd_available, "table": oecd_table,
+             "count_key": "observations", "count_word": "observations", "max_count": 200_000,
+             "default_flow": "DSD_STES@DF_CLI"},
+}
 
 
 def wb_request_controls() -> tuple:
@@ -2085,9 +2154,29 @@ def render_wb_result(source: str, indicator: str, countries: tuple, freq: str, y
         )
 
 
-tab_series, tab_relationship, tab_nyfed, tab_bea, tab_census, tab_bls, tab_treasury, tab_imf, tab_wb = st.tabs(
-    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA", "Census", "BLS", "Treasury", "IMF", "World Bank"]
+(tab_series, tab_relationship, tab_nyfed, tab_bea, tab_census, tab_bls, tab_treasury, tab_imf, tab_oecd,
+ tab_wb) = st.tabs(
+    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA", "Census", "BLS", "Treasury", "IMF", "OECD",
+     "World Bank"]
 )
+
+# --- OECD tab --------------------------------------------------------------
+# Rendered before the Time Series tab so a series added here is selectable there on the same run.
+
+with tab_oecd:
+    st.write(
+        "Query the OECD's [Data Explorer API]"
+        "(https://www.oecd.org/en/data/insights/data-explainers/2024/09/api.html) (SDMX): about 1,500 "
+        "datasets, including composite leading indicators, national accounts, prices, labour, productivity, "
+        "trade, tax, health and education, for OECD members and partners. No key needed. Pick codes for "
+        "each dimension (leave one empty for all), and add series to the Time Series and Relationship tabs."
+    )
+    st.caption(
+        "The OECD allows 60 data downloads an hour from each address (shared by everyone using a deployed "
+        "copy of this app), so results are kept for a day."
+    )
+    sdmx_tab(SDMX_PROVIDERS["oecd"], oecd_flows, "oecd_flow")
+    st.caption("Data: OECD Data Explorer, subject to the OECD Terms and Conditions.")
 
 # --- World Bank tab --------------------------------------------------------
 # Rendered before the Time Series tab so a series added here is selectable there on the same run.
@@ -2134,25 +2223,11 @@ with tab_imf:
         "member country. No key needed. Pick codes for each dimension (leave one empty for all), and add "
         "series to the Time Series and Relationship tabs."
     )
-    try:
-        imf_request = imf_request_controls()
-        if imf_request and st.button("Get data", type="primary", key="imf_get"):
-            st.session_state["imf_request"] = imf_request
-            st.session_state.pop("imf_error", None)
-        saved = st.session_state.get("imf_request")
-        if saved and imf_request and saved[0]["id"] == imf_request[0]["id"]:
-            try:
-                render_imf_result(*saved)
-            except (imf.IMFError, requests.RequestException) as e:
-                st.session_state.pop("imf_request")
-                st.session_state["imf_error"] = (saved[0]["id"], str(e))
-        error = st.session_state.get("imf_error")
-        if error and imf_request and error[0] == imf_request[0]["id"]:
-            st.error(f"IMF request failed: {error[1]}")
-    except (imf.IMFError, requests.RequestException) as e:
-        st.error(f"Couldn't load IMF metadata: {e}")
-    except Exception as e:  # an unexpected response shape shouldn't take down the other tabs
-        st.error(f"Couldn't display this IMF data ({type(e).__name__}: {e}).")
+    imf_vintages = st.toggle(
+        "Include vintage snapshots", key="imf_vintages",
+        help="Frozen past editions of datasets (e.g. a February 2026 vintage), kept for reproducibility.",
+    )
+    sdmx_tab(SDMX_PROVIDERS["imf"], lambda: imf_flows(imf_vintages), f"imf_flow_{imf_vintages}")
     st.caption("Data: International Monetary Fund (IMF Data).")
 
 # --- Treasury tab ----------------------------------------------------------
@@ -2436,6 +2511,16 @@ with tab_series:
                 "`IMF:IMF.STA:CPI:USA.CPI._T.IX.M`."
             )
 
+        with st.expander("OECD series", expanded=bool(st.session_state.get("ts_oecd_series"))):
+            oecd_chosen = st.multiselect(
+                "Series added from the OECD tab", options=st.session_state.get("oecd_added", []),
+                format_func=base_label, key="ts_oecd_series",
+            )
+            st.caption(
+                "Any OECD series also works typed as `OECD:<agency>:<dataflow>:<key>`, e.g. "
+                "`OECD:OECD.SDD.STES:DSD_STES@DF_CLI:USA.M.LI...AA...H`."
+            )
+
         with st.expander("World Bank series", expanded=bool(st.session_state.get("ts_wb_series"))):
             wb_chosen = st.multiselect(
                 "Series added from the World Bank tab", options=st.session_state.get("wb_added", []),
@@ -2448,7 +2533,7 @@ with tab_series:
 
         series_ids = tuple(dict.fromkeys(  # dedupe, keep order
             chosen_labels + nyfed_chosen + [nyfed.PD_PREFIX + k for k in pd_chosen] + bea_chosen
-            + census_chosen + bls_chosen + treasury_chosen + imf_chosen + wb_chosen + custom_ids
+            + census_chosen + bls_chosen + treasury_chosen + imf_chosen + oecd_chosen + wb_chosen + custom_ids
         ))
 
         if series_ids:

@@ -4,11 +4,12 @@ Public datasets need no key. Series are identified by dataflow and SDMX key, e.g
 key USA.CPI._T.IX.M (country . index type . COICOP category . transformation . frequency).
 """
 
-import io
-import re
-
-import pandas as pd
 import requests
+
+from sdmx_data import (  # noqa: F401  (re-exported for callers)
+    clean_name, csv_to_frame, key_string, parse_availability, parse_period, parse_structure,
+    series_key, series_label, series_values,
+)
 
 BASE_URL = "https://api.imf.org/external/sdmx/2.1"
 IMF_PREFIX = "IMF:"
@@ -57,115 +58,29 @@ def dataflows(include_vintages: bool = False) -> list[dict]:
             continue
         out.append({
             "agency": f["agencyID"], "id": f["id"], "version": f["version"],
-            "name": re.sub(r"\s+", " ", (f.get("name") or f["id"]).replace("�", " ")).strip(),
+            "name": clean_name(f.get("name") or f["id"]),
             "description": (f.get("description") or "").strip(), "vintage": vintage,
         })
     return sorted(out, key=lambda f: f["name"].lower())
 
 
 def structure(agency: str, flow: str) -> list[dict]:
-    """The dataset's dimensions in key order: [{'id', 'name', 'codes': {code: name}}]. Each
-    dimension's code list comes from its own representation or, failing that, its concept's."""
-    d = _get(f"dataflow/{agency}/{flow}/latest", JSON, {"references": "all"}).json()["data"]
-    concepts = {}
-    for cs in d.get("conceptSchemes", []):
-        for c in cs.get("concepts", []):
-            concepts[f"urn:sdmx:org.sdmx.infomodel.conceptscheme.Concept={cs['agencyID']}:{cs['id']}({cs['version']}).{c['id']}"] = c
-    codelists = {f"{cl['agencyID']}:{cl['id']}({cl['version']})": cl for cl in d.get("codelists", [])}
-    dsd = d["dataStructures"][0]["dataStructureComponents"]["dimensionList"]["dimensions"]
-    dims = []
-    for dim in sorted(dsd, key=lambda x: x.get("position", 0)):
-        concept = concepts.get(dim.get("conceptIdentity", ""), {})
-        enum = ((dim.get("localRepresentation") or {}).get("enumeration")
-                or (concept.get("coreRepresentation") or {}).get("enumeration") or "")
-        cl = codelists.get(enum.split("=")[-1], {})
-        dims.append({
-            "id": dim["id"], "name": concept.get("name") or dim["id"],
-            "codes": {c["id"]: c.get("name") or c["id"] for c in cl.get("codes", [])},
-        })
-    return dims
-
-
-def key_string(dims: list[dict], selections: dict[str, list[str]]) -> str:
-    """SDMX key for the selections, e.g. 'USA+CAN..._T.IX.M'; an empty dimension means 'all'."""
-    parts = ["+".join(selections.get(d["id"]) or []) for d in dims]
-    return ".".join(parts) if any(parts) else "all"
+    """The dataset's dimensions in key order: [{'id', 'name', 'codes': {code: name}}]."""
+    return parse_structure(_get(f"dataflow/{agency}/{flow}/latest", JSON, {"references": "all"}).json()["data"])
 
 
 def available(agency: str, flow: str, key: str) -> dict:
-    """Which codes have data given a (partial) key: {'values': {dim: [codes]}, 'series': n,
-    'start': 'YYYY-MM-DD', 'end': 'YYYY-MM-DD'}."""
-    d = _get(f"availableconstraint/{agency},{flow}/{key}", JSON, {"mode": "available"}).json()["data"]
-    cc = (d.get("contentConstraints") or [{}])[0]
-    values = {}
-    for region in cc.get("cubeRegions", []):
-        for kv in region.get("keyValues", []):
-            values[kv["id"]] = [v if isinstance(v, str) else v.get("value") for v in kv.get("values", [])]
-    notes = {a.get("id"): a.get("title") for a in cc.get("annotations", [])}
-    return {"values": values, "series": int(notes.get("series_count") or 0),
-            "start": notes.get("time_period_start"), "end": notes.get("time_period_end")}
-
-
-_PERIOD = [
-    (re.compile(r"^(\d{4})-M(\d{2})$"), lambda y, m: pd.Timestamp(int(y), int(m), 1)),
-    (re.compile(r"^(\d{4})-Q([1-4])$"), lambda y, q: pd.Timestamp(int(y), 3 * (int(q) - 1) + 1, 1)),
-    (re.compile(r"^(\d{4})-S([12])$"), lambda y, s: pd.Timestamp(int(y), 6 * (int(s) - 1) + 1, 1)),
-    (re.compile(r"^(\d{4})-(\d{2})-(\d{2})$"), lambda y, m, d: pd.Timestamp(int(y), int(m), int(d))),
-    (re.compile(r"^(\d{4})-(\d{2})$"), lambda y, m: pd.Timestamp(int(y), int(m), 1)),
-    (re.compile(r"^(\d{4})(-A)?$"), lambda y, _=None: pd.Timestamp(int(y), 1, 1)),
-]
-
-
-def parse_period(value) -> pd.Timestamp:
-    """'2025', '2025-Q1', '2025-M01', '2025-S1', '2025-01-15' -> period start (NaT if unknown)."""
-    v = str(value).strip()
-    for pattern, build in _PERIOD:
-        m = pattern.match(v)
-        if m:
-            return build(*m.groups())
-    return pd.NaT
+    """Which codes have data given a (partial) key; see sdmx_data.parse_availability."""
+    data = _get(f"availableconstraint/{agency},{flow}/{key}", JSON, {"mode": "available"}).json()["data"]
+    return parse_availability(data)
 
 
 def get_data(agency: str, flow: str, key: str, dims: list[dict],
-             start_year: int | None = None, end_year: int | None = None) -> pd.DataFrame:
-    """Observations for a key: the dimension columns, TIME_PERIOD, OBS_VALUE (numeric), any
-    UNIT/SCALE attributes, and a parsed `Date`. Attribute-only rows (no time period) and
-    observations without a value are dropped."""
+             start_year: int | None = None, end_year: int | None = None):
+    """Observations for a key as a table; see sdmx_data.csv_to_frame."""
     params = {}
     if start_year:
         params["startPeriod"] = str(start_year)
     if end_year:
         params["endPeriod"] = str(end_year)
-    text = _get(f"data/{agency},{flow}/{key}", CSV, params, timeout=180).text
-    if not text.strip():
-        return pd.DataFrame()
-    df = pd.read_csv(io.StringIO(text), dtype=str)
-    if "TIME_PERIOD" not in df.columns:
-        return pd.DataFrame()
-    df = df[df["TIME_PERIOD"].notna()].copy()
-    df["OBS_VALUE"] = pd.to_numeric(df["OBS_VALUE"], errors="coerce")
-    df = df[df["OBS_VALUE"].notna()]
-    df["Date"] = pd.to_datetime(df["TIME_PERIOD"].map(parse_period))
-    keep = [d["id"] for d in dims if d["id"] in df.columns] + ["TIME_PERIOD", "Date", "OBS_VALUE"]
-    keep += [c for c in ("UNIT", "SCALE") if c in df.columns and df[c].notna().any()]
-    return df[keep].reset_index(drop=True)
-
-
-def series_key(row: pd.Series, dims: list[dict]) -> str:
-    return ".".join(str(row[d["id"]]) for d in dims)
-
-
-def series_label(row: pd.Series, dims: list[dict], varying: list[str]) -> str:
-    """e.g. 'United States · All Items · Index' from the code names of the dimensions that differ
-    between the series in a result (all dimensions if none differ)."""
-    shown = [d for d in dims if d["id"] in varying] or dims
-    return " · ".join(d["codes"].get(str(row[d["id"]]), str(row[d["id"]])) for d in shown)
-
-
-def series_values(df: pd.DataFrame, filters: dict[str, str]) -> pd.Series:
-    mask = pd.Series(True, index=df.index)
-    for col, val in filters.items():
-        mask &= df[col].astype(str) == str(val)
-    rows = df[mask & df["Date"].notna()]
-    s = pd.Series(rows["OBS_VALUE"].to_numpy(dtype=float), index=pd.DatetimeIndex(rows["Date"]))
-    return s[~s.index.duplicated()].sort_index()
+    return csv_to_frame(_get(f"data/{agency},{flow}/{key}", CSV, params, timeout=180).text, dims)

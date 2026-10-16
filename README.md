@@ -32,6 +32,10 @@ An interactive Streamlit app for pulling data from [FRED](https://fred.stlouisfe
 - International Monetary Fund [data API](https://data.imf.org/en/Resource-Pages/IMF-API) (SDMX 2.1, no key needed):
   - The **IMF** tab covers the IMF's ~100 public datasets (World Economic Outlook, CPI, balance of payments, monetary and financial statistics, COFER, commodity prices and more; vintage snapshots optional). Each dimension's picker lists only codes with data given the other choices, with a live count of matching series.
   - IMF series chart alongside everything else as `IMF:<agency>:<dataset>:<key>` (e.g. `IMF:IMF.STA:CPI:USA.CPI._T.IX.M`), from the **IMF series** sidebar picker or typed anywhere a series ID is accepted.
+- OECD [Data Explorer API](https://www.oecd.org/en/data/insights/data-explainers/2024/09/api.html) (SDMX, no key needed):
+  - The **OECD** tab covers ~1,500 OECD datasets (composite leading indicators, national accounts, prices, labour, productivity, trade, tax, health, education and more) with the same narrowing per-dimension pickers as the IMF tab.
+  - Series chart alongside everything else as `OECD:<agency>:<dataflow>:<key>` (e.g. `OECD:OECD.SDD.STES:DSD_STES@DF_CLI:USA.M.LI...AA...H`).
+  - The OECD allows 60 data downloads an hour per IP address (shared by everyone on a deployed app), so results are cached for a day.
 - World Bank [Indicators API](https://datahelpdesk.worldbank.org/knowledgebase/topics/125589-developer-information) (no key needed):
   - The **World Bank** tab covers the World Development Indicators and ~70 other databases: pick an indicator, countries or aggregates (regions, income groups), annual/quarterly/monthly frequency and years.
   - Series chart alongside everything else as `WB:<database>:<indicator>:<country>:<A|Q|M>` (e.g. `WB:2:NY.GDP.MKTP.KD.ZG:USA:A`), from the **World Bank series** sidebar picker or typed anywhere a series ID is accepted.
@@ -110,7 +114,9 @@ To test the secrets path locally first: copy `.streamlit/secrets.toml.example` t
 | `census_data.py` | Census Data API client (dataset catalog, variables, geography, queries, time parsing) |
 | `bls_data.py` | BLS Public Data API v2 client (surveys, popular series, chunked data requests, period parsing) |
 | `treasury_data.py` | Treasury Fiscal Data API client (metadata catalog, distinct values, paged and filtered queries) |
-| `imf_data.py` | IMF SDMX API client (dataflows, dimension code lists, available-value constraints, CSV data, period parsing) |
+| `sdmx_data.py` | Shared SDMX helpers (structures and code lists, availability, CSV data, period parsing, series labels) |
+| `imf_data.py` | IMF SDMX API client (dataflows, structure, availability and data requests) |
+| `oecd_data.py` | OECD Data Explorer SDMX API client (dataflows, structure, availability and data requests) |
 | `worldbank_data.py` | World Bank Indicators API v2 client (databases, indicators, countries, paged queries, period parsing) |
 | `setup_api_key.py` | One-time CLI to store your FRED API key (or your BEA / Census / BLS key, with `--bea` / `--census` / `--bls`) |
 | `requirements.txt` | Python dependencies |
