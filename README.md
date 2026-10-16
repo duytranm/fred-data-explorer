@@ -39,6 +39,10 @@ An interactive Streamlit app for pulling data from [FRED](https://fred.stlouisfe
 - World Bank [Indicators API](https://datahelpdesk.worldbank.org/knowledgebase/topics/125589-developer-information) (no key needed):
   - The **World Bank** tab covers the World Development Indicators and ~70 other databases: pick an indicator, countries or aggregates (regions, income groups), annual/quarterly/monthly frequency and years.
   - Series chart alongside everything else as `WB:<database>:<indicator>:<country>:<A|Q|M>` (e.g. `WB:2:NY.GDP.MKTP.KD.ZG:USA:A`), from the **World Bank series** sidebar picker or typed anywhere a series ID is accepted.
+- Yahoo Finance prices via the unofficial [`yfinance`](https://github.com/ranaroussi/yfinance) library (no key):
+  - The **Yahoo Finance** tab charts daily, weekly or monthly prices (adjusted close, open, high, low or volume) for stocks, ETFs, indexes, FX, crypto and futures, with an OHLCV CSV download.
+  - Tickers chart alongside everything else as `YF:<ticker>` (adjusted close) or `YF:<ticker>:<field>`, e.g. `YF:AAPL`, `YF:^GSPC`, `YF:EURUSD=X`.
+  - Yahoo has no official finance API: this reads Yahoo Finance's website data, which Yahoo licenses for personal use and may rate-limit (especially from cloud servers) or change without notice. Results are cached for an hour.
 
 ## Two ways to run this
 
@@ -118,6 +122,7 @@ To test the secrets path locally first: copy `.streamlit/secrets.toml.example` t
 | `imf_data.py` | IMF SDMX API client (dataflows, structure, availability and data requests) |
 | `oecd_data.py` | OECD Data Explorer SDMX API client (dataflows, structure, availability and data requests) |
 | `worldbank_data.py` | World Bank Indicators API v2 client (databases, indicators, countries, paged queries, period parsing) |
+| `yahoo_data.py` | Yahoo Finance prices via the unofficial `yfinance` library (series IDs, adjusted OHLCV downloads) |
 | `setup_api_key.py` | One-time CLI to store your FRED API key (or your BEA / Census / BLS key, with `--bea` / `--census` / `--bls`) |
 | `requirements.txt` | Python dependencies |
 | `.streamlit/config.toml` | Light theme configuration |

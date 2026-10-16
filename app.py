@@ -37,6 +37,7 @@ import imf_data as imf
 import oecd_data as oecd
 import sdmx_data as sdmx
 import worldbank_data as wb
+import yahoo_data as yahoo
 
 st.set_page_config(page_title="FREDDIE, BEAtrice & ADLER", layout="wide")
 
@@ -156,6 +157,12 @@ def base_label(sid: str) -> str:
         return sdmx_label(sid, oecd, oecd_structure, oecd_flows)
     if wb.is_wb_id(sid):
         return wb_label(sid)
+    if yahoo.is_yf_id(sid):
+        try:
+            ticker, field = yahoo.parse_id(sid)
+        except yahoo.YahooError:
+            return sid
+        return f"Yahoo Finance: {ticker}" + ("" if field == "CLOSE" else f" ({field.lower()})")
     return DEFAULT_SERIES.get(sid) or nyfed.nyfed_label(sid) or sid
 
 
@@ -373,6 +380,12 @@ def wb_label(sid: str) -> str:
     return f"World Bank: {ind_name} — {country_name}" + ("" if freq == "A" else f" ({wb.FREQUENCIES[freq].lower()})")
 
 
+# Yahoo rate-limits heavy use (especially from cloud servers), so prices are kept for an hour.
+@st.cache_data(ttl=3600, show_spinner="Fetching from Yahoo Finance...")
+def yf_prices(tickers: tuple[str, ...], start: str, end: str, interval: str) -> dict[str, pd.DataFrame]:
+    return yahoo.download(list(tickers), start, end, interval)
+
+
 def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
     """Base series side by side: FRED IDs from FRED, `NYFED:` IDs from the NY Fed Markets API,
     `BEA:` IDs from BEA, `CENSUS:` IDs from the Census Bureau, `BLS:` IDs from BLS,
@@ -381,9 +394,21 @@ def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFram
     fred_ids = tuple(
         s for s in series_ids
         if not (nyfed.is_nyfed_id(s) or bea.is_bea_id(s) or census.is_census_id(s) or bls.is_bls_id(s)
-                or treasury.is_treasury_id(s) or imf.is_imf_id(s) or oecd.is_oecd_id(s) or wb.is_wb_id(s))
+                or treasury.is_treasury_id(s) or imf.is_imf_id(s) or oecd.is_oecd_id(s) or wb.is_wb_id(s)
+                or yahoo.is_yf_id(s))
     )
     frames = [fetch(fred_ids, start, end, get_api_key())] if fred_ids else []
+    yf_ids = [s for s in series_ids if yahoo.is_yf_id(s)]
+    if yf_ids:
+        try:
+            parsed = {sid: yahoo.parse_id(sid) for sid in yf_ids}
+            prices = yf_prices(tuple(sorted({t for t, _ in parsed.values()})), start, end, "1d")
+        except (yahoo.YahooError, requests.RequestException) as e:
+            raise ValueError(f"Couldn't fetch {', '.join(yf_ids)} from Yahoo Finance: {e}") from e
+        for sid, (ticker, field) in parsed.items():
+            frame = prices.get(ticker)
+            s = frame[yahoo.FIELDS[field]] if frame is not None else pd.Series(dtype=float, index=pd.DatetimeIndex([]))
+            frames.append(s.rename(base_label(sid)))
     bls_ids = tuple(s for s in series_ids if bls.is_bls_id(s))
     if bls_ids:
         try:
@@ -2154,11 +2179,101 @@ def render_wb_result(source: str, indicator: str, countries: tuple, freq: str, y
         )
 
 
+def yf_request_controls() -> tuple | None:
+    """Inputs for a Yahoo Finance request. Returns (tickers, start, end, interval, field) or None."""
+    typed = st.text_input(
+        "Tickers (comma-separated)", value="SPY, QQQ", key="yf_tickers",
+        help="Yahoo Finance symbols: stocks (AAPL), ETFs (SPY), indexes (^GSPC, ^VIX), FX (EURUSD=X), "
+             "crypto (BTC-USD), futures (CL=F).",
+    )
+    tickers = list(dict.fromkeys(t.strip().upper() for t in typed.split(",") if t.strip()))
+    c1, c2 = st.columns([1, 1])
+    interval = c1.radio("Interval", list(yahoo.INTERVALS), format_func=yahoo.INTERVALS.get, horizontal=True,
+                        key="yf_interval")
+    field = c2.selectbox("Value", list(yahoo.FIELDS), key="yf_field",
+                         format_func=lambda f: "Close (adjusted for splits and dividends)" if f == "CLOSE" else f.title())
+    today = datetime.date.today()
+    start, end = st.slider(
+        "Dates", min_value=datetime.date(1970, 1, 1), max_value=today,
+        value=(today - datetime.timedelta(days=5 * 365), today), format="YYYY-MM-DD", key="yf_dates",
+    )
+    if not tickers:
+        st.caption("Enter at least one ticker.")
+        return None
+    return tuple(tickers), start.isoformat(), end.isoformat(), interval, field
+
+
+def render_yf_result(tickers: tuple, start: str, end: str, interval: str, field: str):
+    prices = yf_prices(tickers, start, end, interval)
+    missing = [t for t in tickers if t not in prices]
+    if missing:
+        st.warning("No data for: " + ", ".join(missing) + " (check the symbols; delisted tickers return nothing).")
+    if not prices:
+        return
+    col = yahoo.FIELDS[field]
+    wide = pd.DataFrame({t: frame[col] for t, frame in prices.items()}).sort_index()
+    wide.index.name = "Date"
+    request_key = f"{zlib.crc32(repr((tickers, start, end, interval, field)).encode())}"
+    st.caption(f"{yahoo.INTERVALS[interval]} {col.lower()} · {start} to {end} — {len(wide):,} rows")
+    st.dataframe(wide.reset_index(), use_container_width=True, height=320, hide_index=True,
+                 column_config={"Date": st.column_config.DateColumn("Date")})
+    long_all = pd.concat({t: f for t, f in prices.items()}, names=["Ticker", "Date"]).reset_index()
+    st.download_button(
+        "Download all prices (OHLCV) as CSV", long_all.to_csv(index=False).encode("utf-8"),
+        file_name="yahoo_prices.csv", mime="text/csv", key=f"yf_csv_{request_key}",
+    )
+    long = wide.reset_index().melt(id_vars="Date", var_name="ticker", value_name="value").dropna()
+    fig = px.line(long, x="Date", y="value", color="ticker")
+    fig.update_layout(height=420, margin=dict(l=40, r=20, t=30, b=40), legend_title_text=None,
+                      legend=dict(orientation="h", yanchor="top", y=-0.15), yaxis_title=col)
+    st.plotly_chart(fig, use_container_width=True, key=f"yf_chart_{request_key}")
+    if interval != "1d":
+        st.caption("Series added to the other tabs use daily prices; resample there for weekly or monthly views.")
+    if st.button("Add to the Time Series and Relationship tabs", key=f"yf_add_{request_key}"):
+        added = [yahoo.make_id(t, field) for t in prices]
+        st.session_state["yf_added"] = list(dict.fromkeys(st.session_state.get("yf_added", []) + added))
+        st.session_state["ts_yf_series"] = list(dict.fromkeys(st.session_state.get("ts_yf_series", []) + added))
+        st.success(
+            "Added and selected in the Time Series sidebar (under **Yahoo Finance series**). Elsewhere, use the ID: "
+            + ", ".join(f"`{s}`" for s in added)
+        )
+
+
 (tab_series, tab_relationship, tab_nyfed, tab_bea, tab_census, tab_bls, tab_treasury, tab_imf, tab_oecd,
- tab_wb) = st.tabs(
+ tab_wb, tab_yf) = st.tabs(
     ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA", "Census", "BLS", "Treasury", "IMF", "OECD",
-     "World Bank"]
+     "World Bank", "Yahoo Finance"]
 )
+
+# --- Yahoo Finance tab -----------------------------------------------------
+# Rendered before the Time Series tab so a series added here is selectable there on the same run.
+
+with tab_yf:
+    st.write(
+        "Prices for stocks, ETFs, indexes, FX, crypto and futures from Yahoo Finance, via the unofficial "
+        "[`yfinance`](https://github.com/ranaroussi/yfinance) library. Add tickers to the Time Series and "
+        "Relationship tabs to chart them alongside economic data."
+    )
+    st.caption(
+        "Yahoo has no official finance API: this reads Yahoo Finance's website data, which Yahoo licenses for "
+        "personal use and may rate-limit or change without notice. Prices are kept for an hour to limit requests."
+    )
+    try:
+        yf_request = yf_request_controls()
+        if yf_request and st.button("Get data", type="primary", key="yf_get"):
+            st.session_state["yf_request"] = yf_request
+            st.session_state.pop("yf_error", None)
+        saved = st.session_state.get("yf_request")
+        if saved:
+            try:
+                render_yf_result(*saved)
+            except (yahoo.YahooError, requests.RequestException) as e:
+                st.session_state.pop("yf_request")
+                st.session_state["yf_error"] = str(e)
+        if st.session_state.get("yf_error"):
+            st.error(f"Yahoo Finance request failed: {st.session_state['yf_error']}")
+    except Exception as e:  # yfinance can fail in many ways when Yahoo changes its site
+        st.error(f"Couldn't display Yahoo Finance data ({type(e).__name__}: {e}).")
 
 # --- OECD tab --------------------------------------------------------------
 # Rendered before the Time Series tab so a series added here is selectable there on the same run.
@@ -2521,6 +2636,16 @@ with tab_series:
                 "`OECD:OECD.SDD.STES:DSD_STES@DF_CLI:USA.M.LI...AA...H`."
             )
 
+        with st.expander("Yahoo Finance series", expanded=bool(st.session_state.get("ts_yf_series"))):
+            yf_chosen = st.multiselect(
+                "Series added from the Yahoo Finance tab", options=st.session_state.get("yf_added", []),
+                format_func=base_label, key="ts_yf_series",
+            )
+            st.caption(
+                "Any ticker also works typed as `YF:<ticker>` (adjusted close) or `YF:<ticker>:<field>` "
+                "(OPEN, HIGH, LOW, VOLUME), e.g. `YF:AAPL`, `YF:^GSPC`, `YF:EURUSD=X`."
+            )
+
         with st.expander("World Bank series", expanded=bool(st.session_state.get("ts_wb_series"))):
             wb_chosen = st.multiselect(
                 "Series added from the World Bank tab", options=st.session_state.get("wb_added", []),
@@ -2533,7 +2658,8 @@ with tab_series:
 
         series_ids = tuple(dict.fromkeys(  # dedupe, keep order
             chosen_labels + nyfed_chosen + [nyfed.PD_PREFIX + k for k in pd_chosen] + bea_chosen
-            + census_chosen + bls_chosen + treasury_chosen + imf_chosen + oecd_chosen + wb_chosen + custom_ids
+            + census_chosen + bls_chosen + treasury_chosen + imf_chosen + oecd_chosen + wb_chosen + yf_chosen
+            + custom_ids
         ))
 
         if series_ids:
