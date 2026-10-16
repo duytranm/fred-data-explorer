@@ -33,6 +33,7 @@ import bea_data as bea
 import census_data as census
 import bls_data as bls
 import treasury_data as treasury
+import imf_data as imf
 
 st.set_page_config(page_title="FREDDIE, BEAtrice & ADLER", layout="wide")
 
@@ -146,6 +147,8 @@ def base_label(sid: str) -> str:
         return get_treasury_series()[sid]["label"]
     if bls.is_bls_id(sid):
         return st.session_state.get("bls_titles", {}).get(sid[len(bls.BLS_PREFIX):]) or f"BLS {sid[len(bls.BLS_PREFIX):]}"
+    if imf.is_imf_id(sid):
+        return imf_label(sid)
     return DEFAULT_SERIES.get(sid) or nyfed.nyfed_label(sid) or sid
 
 
@@ -275,14 +278,46 @@ def treasury_table(endpoint: str, fields: tuple, date_field: str | None, start: 
     return treasury.get_data(endpoint, field_dicts, date_field, start, end, filter_field, filter_values)
 
 
+@st.cache_data(ttl=86400, show_spinner="Loading IMF datasets...")
+def imf_flows(include_vintages: bool) -> list[dict]:
+    return imf.dataflows(include_vintages)
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading the IMF dataset's structure...")
+def imf_structure(agency: str, flow: str) -> list[dict]:
+    return imf.structure(agency, flow)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def imf_available(agency: str, flow: str, key: str) -> dict:
+    return imf.available(agency, flow, key)
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching from the IMF...")
+def imf_table(agency: str, flow: str, key: str, start_year: int | None, end_year: int | None) -> pd.DataFrame:
+    return imf.get_data(agency, flow, key, imf_structure(agency, flow), start_year, end_year)
+
+
+def imf_label(sid: str) -> str:
+    """e.g. 'CPI: United States · Consumer price index · All Items · Index · Monthly', from the
+    dataset's code names (the ID itself if the structure can't be loaded)."""
+    try:
+        agency, flow, key = imf.parse_id(sid)
+        dims = imf_structure(agency, flow)
+    except (imf.IMFError, requests.RequestException, KeyError):
+        return sid
+    codes = key.split(".")
+    return f"{flow}: " + " · ".join(d["codes"].get(c, c) for d, c in zip(dims, codes))
+
+
 def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
     """Base series side by side: FRED IDs from FRED, `NYFED:` IDs from the NY Fed Markets API,
     `BEA:` IDs from BEA, `CENSUS:` IDs from the Census Bureau, `BLS:` IDs from BLS,
-    `TREASURY:` IDs from Treasury Fiscal Data."""
+    `TREASURY:` IDs from Treasury Fiscal Data, `IMF:` IDs from the IMF."""
     fred_ids = tuple(
         s for s in series_ids
         if not (nyfed.is_nyfed_id(s) or bea.is_bea_id(s) or census.is_census_id(s) or bls.is_bls_id(s)
-                or treasury.is_treasury_id(s))
+                or treasury.is_treasury_id(s) or imf.is_imf_id(s))
     )
     frames = [fetch(fred_ids, start, end, get_api_key())] if fred_ids else []
     bls_ids = tuple(s for s in series_ids if bls.is_bls_id(s))
@@ -337,6 +372,14 @@ def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFram
             else:
                 s = treasury.series_values(table, spec["filters"], spec["value_col"], date_field)
                 frames.append(s.rename(base_label(sid)))
+        elif imf.is_imf_id(sid):
+            try:
+                agency, flow, key = imf.parse_id(sid)
+                table = imf_table(agency, flow, key, int(start[:4]), int(end[:4]))
+            except (imf.IMFError, requests.RequestException) as e:
+                raise ValueError(f"Couldn't fetch {sid} from the IMF: {e}") from e
+            s = imf.series_values(table, {}) if not table.empty else pd.Series(dtype=float, index=pd.DatetimeIndex([]))
+            frames.append(s.loc[start:end].rename(base_label(sid)))
     return pd.concat(frames, axis=1, sort=True) if frames else pd.DataFrame()
 
 
@@ -1835,9 +1878,136 @@ def render_treasury_table(tb: dict, start: str | None, end: str | None, filter_f
         )
 
 
-tab_series, tab_relationship, tab_nyfed, tab_bea, tab_census, tab_bls, tab_treasury = st.tabs(
-    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA", "Census", "BLS", "Treasury"]
+IMF_MAX_SERIES = 500  # per request; the narrowing controls show the count before fetching
+
+
+def imf_request_controls() -> tuple | None:
+    """Inputs for an IMF query. Returns (dataset, dimensions, key, start year, end year,
+    matching series count) or None."""
+    vintages = st.toggle("Include vintage snapshots", key="imf_vintages",
+                         help="Frozen past editions of datasets (e.g. a February 2026 vintage), kept for reproducibility.")
+    flows = imf_flows(vintages)
+    names = {i: f"{f['name']} ({f['id']})" for i, f in enumerate(flows)}
+    default = next((i for i, f in enumerate(flows) if f["id"] == "CPI"), 0)
+    i = st.selectbox(f"Dataset ({len(flows)} — type to search)", list(names), index=default,
+                     format_func=names.get, key=f"imf_flow_{vintages}")
+    flow = flows[i]
+    if flow["description"]:
+        st.caption(flow["description"][:400] + ("…" if len(flow["description"]) > 400 else ""))
+    dims = imf_structure(flow["agency"], flow["id"])
+
+    # Each dimension lists only codes that have data given the other choices, so read the
+    # current choices first, ask the API what's available, then draw the pickers.
+    prefix = f"imf_{flow['agency']}_{flow['id']}"
+    selections = {d["id"]: st.session_state.get(f"{prefix}_{d['id']}", []) for d in dims}
+    key = imf.key_string(dims, selections)
+    avail = imf_available(flow["agency"], flow["id"], key)
+    cols = st.columns(2)
+    for n, d in enumerate(dims):
+        options = list(dict.fromkeys(avail["values"].get(d["id"], []) + selections[d["id"]]))
+        with cols[n % 2]:
+            st.multiselect(
+                f"{d['name']} ({len(options):,})", options, key=f"{prefix}_{d['id']}", placeholder="All",
+                format_func=lambda c, d=d: f"{d['codes'].get(c, c)} ({c})",
+            )
+    n_series = avail["series"]
+    span = f"{(avail['start'] or '')[:4]}–{(avail['end'] or '')[:4]}"
+    if n_series == 0:
+        st.warning("No series match these choices. Remove one to widen the search.")
+        return None
+    st.caption(f"{n_series:,} series match · data {span}")
+    if n_series > IMF_MAX_SERIES:
+        st.info(f"Narrow the choices above to {IMF_MAX_SERIES} series or fewer to fetch data.")
+        return None
+    try:
+        lo, hi = int(avail["start"][:4]), int(avail["end"][:4])
+    except (TypeError, ValueError):
+        lo, hi = 1950, datetime.date.today().year
+    y0, y1 = (lo, hi) if lo >= hi else st.slider(
+        "Years", min_value=lo, max_value=hi, value=(max(lo, min(hi, datetime.date.today().year) - 10), hi),
+        key=f"{prefix}_years",
+    )
+    return flow, dims, key, y0, y1, n_series
+
+
+def render_imf_result(flow: dict, dims: list[dict], key: str, y0: int, y1: int, n_series: int):
+    df = imf_table(flow["agency"], flow["id"], key, y0, y1)
+    st.caption(f"**{flow['name']}** · key `{key}` · {y0}–{y1} — {len(df):,} observations")
+    if df.empty:
+        st.info("No observations in this range.")
+        return
+    request_key = f"{zlib.crc32(repr((flow['id'], key, y0, y1)).encode())}"
+    st.dataframe(df, use_container_width=True, height=320,
+                 column_config={"Date": st.column_config.DateColumn("Date")})
+    st.download_button(
+        "Download table as CSV", df.to_csv(index=False).encode("utf-8"),
+        file_name=f"imf_{flow['id'].lower()}.csv", mime="text/csv", key=f"imf_csv_{request_key}",
+    )
+    dim_ids = [d["id"] for d in dims if d["id"] in df.columns]
+    varying = [c for c in dim_ids if df[c].nunique() > 1]
+    catalog = df.drop_duplicates(dim_ids).reset_index(drop=True)
+    labels = [imf.series_label(row, dims, varying) for _, row in catalog.iterrows()]
+    picked = st.multiselect(
+        f"Series ({len(catalog):,} in this result)", list(range(len(catalog))), default=[0],
+        format_func=lambda i: labels[i], key=f"imf_pick_{request_key}",
+    )
+    if not picked:
+        return
+    long = pd.concat([
+        imf.series_values(df, {c: catalog.iloc[i][c] for c in dim_ids}).rename("value").rename_axis("Date")
+        .reset_index().assign(series=labels[i])
+        for i in picked
+    ])
+    fig = px.line(long.dropna(), x="Date", y="value", color="series", markers=len(long) <= 60)
+    fig.update_layout(height=420, margin=dict(l=40, r=20, t=30, b=40), legend_title_text=None,
+                      legend=dict(orientation="h", yanchor="top", y=-0.15))
+    st.plotly_chart(fig, use_container_width=True, key=f"imf_chart_{request_key}")
+
+    if st.button("Add to the Time Series and Relationship tabs", key=f"imf_add_{request_key}"):
+        added = [imf.make_id(flow["agency"], flow["id"], imf.series_key(catalog.iloc[i], dims)) for i in picked]
+        st.session_state["imf_added"] = list(dict.fromkeys(st.session_state.get("imf_added", []) + added))
+        st.session_state["ts_imf_series"] = list(dict.fromkeys(st.session_state.get("ts_imf_series", []) + added))
+        st.success(
+            "Added and selected in the Time Series sidebar (under **IMF series**). Elsewhere, use the ID: "
+            + ", ".join(f"`{s}`" for s in added)
+        )
+
+
+tab_series, tab_relationship, tab_nyfed, tab_bea, tab_census, tab_bls, tab_treasury, tab_imf = st.tabs(
+    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA", "Census", "BLS", "Treasury", "IMF"]
 )
+
+# --- IMF tab ---------------------------------------------------------------
+# Rendered before the Time Series tab so a series added here is selectable there on the same run.
+
+with tab_imf:
+    st.write(
+        "Query the International Monetary Fund's [data API](https://data.imf.org/en/Resource-Pages/IMF-API) "
+        "(SDMX): the World Economic Outlook, CPI, balance of payments, monetary and financial statistics, "
+        "government finance, exchange rates, commodity prices, reserves (COFER) and more, for every IMF "
+        "member country. No key needed. Pick codes for each dimension (leave one empty for all), and add "
+        "series to the Time Series and Relationship tabs."
+    )
+    try:
+        imf_request = imf_request_controls()
+        if imf_request and st.button("Get data", type="primary", key="imf_get"):
+            st.session_state["imf_request"] = imf_request
+            st.session_state.pop("imf_error", None)
+        saved = st.session_state.get("imf_request")
+        if saved and imf_request and saved[0]["id"] == imf_request[0]["id"]:
+            try:
+                render_imf_result(*saved)
+            except (imf.IMFError, requests.RequestException) as e:
+                st.session_state.pop("imf_request")
+                st.session_state["imf_error"] = (saved[0]["id"], str(e))
+        error = st.session_state.get("imf_error")
+        if error and imf_request and error[0] == imf_request[0]["id"]:
+            st.error(f"IMF request failed: {error[1]}")
+    except (imf.IMFError, requests.RequestException) as e:
+        st.error(f"Couldn't load IMF metadata: {e}")
+    except Exception as e:  # an unexpected response shape shouldn't take down the other tabs
+        st.error(f"Couldn't display this IMF data ({type(e).__name__}: {e}).")
+    st.caption("Data: International Monetary Fund (IMF Data).")
 
 # --- Treasury tab ----------------------------------------------------------
 # Rendered before the Time Series tab so a series added here is selectable there on the same run.
@@ -2110,9 +2280,19 @@ with tab_series:
             if not treasury_defs:
                 st.caption("Fetch a table in the **Treasury** tab, then add series from it to chart them here.")
 
+        with st.expander("IMF series", expanded=bool(st.session_state.get("ts_imf_series"))):
+            imf_chosen = st.multiselect(
+                "Series added from the IMF tab", options=st.session_state.get("imf_added", []),
+                format_func=base_label, key="ts_imf_series",
+            )
+            st.caption(
+                "Any IMF series also works typed as `IMF:<agency>:<dataset>:<key>`, e.g. "
+                "`IMF:IMF.STA:CPI:USA.CPI._T.IX.M`."
+            )
+
         series_ids = tuple(dict.fromkeys(  # dedupe, keep order
             chosen_labels + nyfed_chosen + [nyfed.PD_PREFIX + k for k in pd_chosen] + bea_chosen
-            + census_chosen + bls_chosen + treasury_chosen + custom_ids
+            + census_chosen + bls_chosen + treasury_chosen + imf_chosen + custom_ids
         ))
 
         if series_ids:

@@ -29,6 +29,9 @@ An interactive Streamlit app for pulling data from [FRED](https://fred.stlouisfe
 - U.S. Treasury [Fiscal Data API](https://fiscaldata.treasury.gov/api-documentation/) (no key needed):
   - The **Treasury** tab covers every Fiscal Data dataset and table (Debt to the Penny, Daily and Monthly Treasury Statements, average interest rates, exchange rates, auctions and more), loaded from Fiscal Data's metadata service, with a date-range slider and an optional filter on any text field.
   - Series from a fetched table can be added to the Time Series and Relationship tabs. Results are capped at 100,000 rows per request, with a notice when a query matches more.
+- International Monetary Fund [data API](https://data.imf.org/en/Resource-Pages/IMF-API) (SDMX 2.1, no key needed):
+  - The **IMF** tab covers the IMF's ~100 public datasets (World Economic Outlook, CPI, balance of payments, monetary and financial statistics, COFER, commodity prices and more; vintage snapshots optional). Each dimension's picker lists only codes with data given the other choices, with a live count of matching series.
+  - IMF series chart alongside everything else as `IMF:<agency>:<dataset>:<key>` (e.g. `IMF:IMF.STA:CPI:USA.CPI._T.IX.M`), from the **IMF series** sidebar picker or typed anywhere a series ID is accepted.
 
 ## Two ways to run this
 
@@ -104,6 +107,7 @@ To test the secrets path locally first: copy `.streamlit/secrets.toml.example` t
 | `census_data.py` | Census Data API client (dataset catalog, variables, geography, queries, time parsing) |
 | `bls_data.py` | BLS Public Data API v2 client (surveys, popular series, chunked data requests, period parsing) |
 | `treasury_data.py` | Treasury Fiscal Data API client (metadata catalog, distinct values, paged and filtered queries) |
+| `imf_data.py` | IMF SDMX API client (dataflows, dimension code lists, available-value constraints, CSV data, period parsing) |
 | `setup_api_key.py` | One-time CLI to store your FRED API key (or your BEA / Census / BLS key, with `--bea` / `--census` / `--bls`) |
 | `requirements.txt` | Python dependencies |
 | `.streamlit/config.toml` | Light theme configuration |
