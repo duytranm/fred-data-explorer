@@ -32,6 +32,9 @@ An interactive Streamlit app for pulling data from [FRED](https://fred.stlouisfe
 - International Monetary Fund [data API](https://data.imf.org/en/Resource-Pages/IMF-API) (SDMX 2.1, no key needed):
   - The **IMF** tab covers the IMF's ~100 public datasets (World Economic Outlook, CPI, balance of payments, monetary and financial statistics, COFER, commodity prices and more; vintage snapshots optional). Each dimension's picker lists only codes with data given the other choices, with a live count of matching series.
   - IMF series chart alongside everything else as `IMF:<agency>:<dataset>:<key>` (e.g. `IMF:IMF.STA:CPI:USA.CPI._T.IX.M`), from the **IMF series** sidebar picker or typed anywhere a series ID is accepted.
+- World Bank [Indicators API](https://datahelpdesk.worldbank.org/knowledgebase/topics/125589-developer-information) (no key needed):
+  - The **World Bank** tab covers the World Development Indicators and ~70 other databases: pick an indicator, countries or aggregates (regions, income groups), annual/quarterly/monthly frequency and years.
+  - Series chart alongside everything else as `WB:<database>:<indicator>:<country>:<A|Q|M>` (e.g. `WB:2:NY.GDP.MKTP.KD.ZG:USA:A`), from the **World Bank series** sidebar picker or typed anywhere a series ID is accepted.
 
 ## Two ways to run this
 
@@ -108,6 +111,7 @@ To test the secrets path locally first: copy `.streamlit/secrets.toml.example` t
 | `bls_data.py` | BLS Public Data API v2 client (surveys, popular series, chunked data requests, period parsing) |
 | `treasury_data.py` | Treasury Fiscal Data API client (metadata catalog, distinct values, paged and filtered queries) |
 | `imf_data.py` | IMF SDMX API client (dataflows, dimension code lists, available-value constraints, CSV data, period parsing) |
+| `worldbank_data.py` | World Bank Indicators API v2 client (databases, indicators, countries, paged queries, period parsing) |
 | `setup_api_key.py` | One-time CLI to store your FRED API key (or your BEA / Census / BLS key, with `--bea` / `--census` / `--bls`) |
 | `requirements.txt` | Python dependencies |
 | `.streamlit/config.toml` | Light theme configuration |

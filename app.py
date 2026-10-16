@@ -34,6 +34,7 @@ import census_data as census
 import bls_data as bls
 import treasury_data as treasury
 import imf_data as imf
+import worldbank_data as wb
 
 st.set_page_config(page_title="FREDDIE, BEAtrice & ADLER", layout="wide")
 
@@ -149,6 +150,8 @@ def base_label(sid: str) -> str:
         return st.session_state.get("bls_titles", {}).get(sid[len(bls.BLS_PREFIX):]) or f"BLS {sid[len(bls.BLS_PREFIX):]}"
     if imf.is_imf_id(sid):
         return imf_label(sid)
+    if wb.is_wb_id(sid):
+        return wb_label(sid)
     return DEFAULT_SERIES.get(sid) or nyfed.nyfed_label(sid) or sid
 
 
@@ -310,14 +313,47 @@ def imf_label(sid: str) -> str:
     return f"{flow}: " + " · ".join(d["codes"].get(c, c) for d, c in zip(dims, codes))
 
 
+@st.cache_data(ttl=86400, show_spinner="Loading World Bank databases...")
+def wb_sources() -> dict[str, str]:
+    return wb.sources()
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading World Bank indicators...")
+def wb_indicators(source: str) -> list[dict]:
+    return wb.indicators(source)
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading World Bank countries...")
+def wb_countries() -> list[dict]:
+    return wb.countries()
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching from the World Bank...")
+def wb_table(source: str, indicator: str, countries: tuple, freq: str, start_year: int, end_year: int) -> pd.DataFrame:
+    return wb.get_data(source, indicator, list(countries), freq, start_year, end_year)
+
+
+def wb_label(sid: str) -> str:
+    """e.g. 'World Bank: GDP growth (annual %) — United States' (with the frequency when not
+    annual); the ID itself if the lists can't be loaded."""
+    try:
+        source, indicator, country, freq = wb.parse_id(sid)
+        ind_name = next((i["name"] for i in wb_indicators(source) if i["id"].upper() == indicator.upper()), indicator)
+        country_name = next((c["name"] for c in wb_countries() if c["id"].upper() == country.upper()), country)
+    except (wb.WorldBankError, requests.RequestException):
+        return sid
+    return f"World Bank: {ind_name} — {country_name}" + ("" if freq == "A" else f" ({wb.FREQUENCIES[freq].lower()})")
+
+
 def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
     """Base series side by side: FRED IDs from FRED, `NYFED:` IDs from the NY Fed Markets API,
     `BEA:` IDs from BEA, `CENSUS:` IDs from the Census Bureau, `BLS:` IDs from BLS,
-    `TREASURY:` IDs from Treasury Fiscal Data, `IMF:` IDs from the IMF."""
+    `TREASURY:` IDs from Treasury Fiscal Data, `IMF:` IDs from the IMF, `WB:` IDs from the
+    World Bank."""
     fred_ids = tuple(
         s for s in series_ids
         if not (nyfed.is_nyfed_id(s) or bea.is_bea_id(s) or census.is_census_id(s) or bls.is_bls_id(s)
-                or treasury.is_treasury_id(s) or imf.is_imf_id(s))
+                or treasury.is_treasury_id(s) or imf.is_imf_id(s) or wb.is_wb_id(s))
     )
     frames = [fetch(fred_ids, start, end, get_api_key())] if fred_ids else []
     bls_ids = tuple(s for s in series_ids if bls.is_bls_id(s))
@@ -380,6 +416,13 @@ def fetch_base(series_ids: tuple[str, ...], start: str, end: str) -> pd.DataFram
                 raise ValueError(f"Couldn't fetch {sid} from the IMF: {e}") from e
             s = imf.series_values(table, {}) if not table.empty else pd.Series(dtype=float, index=pd.DatetimeIndex([]))
             frames.append(s.loc[start:end].rename(base_label(sid)))
+        elif wb.is_wb_id(sid):
+            try:
+                source, indicator, country, freq = wb.parse_id(sid)
+                table = wb_table(source, indicator, (country,), freq, int(start[:4]), int(end[:4]))
+            except (wb.WorldBankError, requests.RequestException) as e:
+                raise ValueError(f"Couldn't fetch {sid} from the World Bank: {e}") from e
+            frames.append(wb.series_values(table, country).loc[start:end].rename(base_label(sid)))
     return pd.concat(frames, axis=1, sort=True) if frames else pd.DataFrame()
 
 
@@ -1732,7 +1775,7 @@ def render_bls_result(series_ids: tuple, start_year: int, end_year: int):
     wide = pd.concat({label[s]: data[s] for s in found}, axis=1, sort=True)
     wide.index.name = "Date"
     request_key = f"{zlib.crc32(repr((series_ids, start_year, end_year)).encode())}"
-    st.dataframe(wide, use_container_width=True, height=320,
+    st.dataframe(wide.reset_index(), use_container_width=True, height=320, hide_index=True,
                  column_config={"Date": st.column_config.DateColumn("Date")})
     st.download_button(
         "Download as CSV", wide.to_csv().encode("utf-8"), file_name="bls_series.csv", mime="text/csv",
@@ -1973,9 +2016,112 @@ def render_imf_result(flow: dict, dims: list[dict], key: str, y0: int, y1: int, 
         )
 
 
-tab_series, tab_relationship, tab_nyfed, tab_bea, tab_census, tab_bls, tab_treasury, tab_imf = st.tabs(
-    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA", "Census", "BLS", "Treasury", "IMF"]
+def wb_request_controls() -> tuple:
+    """Inputs for a World Bank request. Returns (database id, indicator, country codes,
+    frequency, start year, end year)."""
+    source_names = wb_sources()
+    sources_list = list(source_names)
+    source = st.selectbox(
+        f"Database ({len(sources_list)})", sources_list, format_func=source_names.get, key="wb_source",
+        index=sources_list.index(wb.WDI_SOURCE) if wb.WDI_SOURCE in sources_list else 0,
+    )
+    inds = wb_indicators(source)
+    ind_ids = [i["id"] for i in inds]
+    ind_names = {i["id"]: i["name"] for i in inds}
+    default_ind = "NY.GDP.MKTP.KD.ZG"
+    indicator = st.selectbox(
+        f"Indicator ({len(ind_ids):,} — type to search)", ind_ids, key=f"wb_indicator_{source}",
+        index=ind_ids.index(default_ind) if default_ind in ind_ids else 0,
+        format_func=lambda i: f"{ind_names[i]} ({i})",
+    )
+    note = next((i["note"] for i in inds if i["id"] == indicator), "")
+    if note:
+        st.caption(note[:400] + ("…" if len(note) > 400 else ""))
+    countries_list = wb_countries()
+    names = {c["id"]: c["name"] + (" (aggregate)" if c["aggregate"] else "") for c in countries_list}
+    default = [c for c in ("USA", "CHN", "EUU") if c in names]
+    picked = st.multiselect(
+        f"Countries and aggregates ({len(names)})", list(names), default=default, key="wb_countries",
+        format_func=lambda c: f"{names[c]} ({c})",
+    )
+    c1, c2 = st.columns([1, 3])
+    freq = c1.radio("Frequency", list(wb.FREQUENCIES), format_func=wb.FREQUENCIES.get, key="wb_freq",
+                    help="Most databases are annual; some (e.g. Global Economic Monitor) also have quarterly or monthly data.")
+    this_year = datetime.date.today().year
+    y0, y1 = c2.slider("Years", min_value=1960, max_value=this_year, value=(2000, this_year), key="wb_years")
+    return source, indicator, tuple(picked), freq, y0, y1
+
+
+def render_wb_result(source: str, indicator: str, countries: tuple, freq: str, y0: int, y1: int):
+    df = wb_table(source, indicator, countries, freq, y0, y1)
+    ind_name = next((i["name"] for i in wb_indicators(source) if i["id"] == indicator), indicator)
+    st.caption(f"**{ind_name}** ({indicator}) · {wb.FREQUENCIES[freq].lower()} · {y0}–{y1} — {len(df):,} observations")
+    missing = [c for c in countries if c.upper() not in set(df["country"].str.upper())]
+    if missing:
+        st.warning("No data for: " + ", ".join(missing) + (". Try another frequency or years." if df.empty else "."))
+    if df.empty:
+        return
+    request_key = f"{zlib.crc32(repr((source, indicator, countries, freq, y0, y1)).encode())}"
+    wide = df.pivot_table(index="Date", columns="country_name", values="value").reset_index()
+    st.dataframe(wide, use_container_width=True, height=320, hide_index=True,
+                 column_config={"Date": st.column_config.DateColumn("Date")})
+    st.download_button(
+        "Download as CSV", df.drop(columns="Date").to_csv(index=False).encode("utf-8"),
+        file_name=f"worldbank_{indicator.lower()}.csv", mime="text/csv", key=f"wb_csv_{request_key}",
+    )
+    fig = px.line(df, x="Date", y="value", color="country_name", markers=df["Date"].nunique() <= 40)
+    fig.update_layout(height=420, margin=dict(l=40, r=20, t=30, b=40), legend_title_text=None,
+                      legend=dict(orientation="h", yanchor="top", y=-0.15), yaxis_title=ind_name)
+    st.plotly_chart(fig, use_container_width=True, key=f"wb_chart_{request_key}")
+
+    found = list(dict.fromkeys(df["country"]))
+    if st.button("Add to the Time Series and Relationship tabs", key=f"wb_add_{request_key}"):
+        added = [wb.make_id(source, indicator, c, freq) for c in found]
+        st.session_state["wb_added"] = list(dict.fromkeys(st.session_state.get("wb_added", []) + added))
+        st.session_state["ts_wb_series"] = list(dict.fromkeys(st.session_state.get("ts_wb_series", []) + added))
+        st.success(
+            "Added and selected in the Time Series sidebar (under **World Bank series**). Elsewhere, use the ID: "
+            + ", ".join(f"`{s}`" for s in added)
+        )
+
+
+tab_series, tab_relationship, tab_nyfed, tab_bea, tab_census, tab_bls, tab_treasury, tab_imf, tab_wb = st.tabs(
+    ["Time Series", "Relationship (X vs Y)", "NY Fed Markets", "BEA", "Census", "BLS", "Treasury", "IMF", "World Bank"]
 )
+
+# --- World Bank tab --------------------------------------------------------
+# Rendered before the Time Series tab so a series added here is selectable there on the same run.
+
+with tab_wb:
+    st.write(
+        "Query the World Bank's [Indicators API]"
+        "(https://datahelpdesk.worldbank.org/knowledgebase/topics/125589-developer-information): the World "
+        "Development Indicators and about 70 other databases (governance, education, debt, the Global "
+        "Economic Monitor and more), for every country plus regional and income-group aggregates. No key "
+        "needed. Results can be added to the Time Series and Relationship tabs."
+    )
+    try:
+        wb_request = wb_request_controls()
+        if not wb_request[2]:
+            st.caption("Pick at least one country or aggregate.")
+        elif st.button("Get data", type="primary", key="wb_get"):
+            st.session_state["wb_request"] = wb_request
+            st.session_state.pop("wb_error", None)
+        saved = st.session_state.get("wb_request")
+        if saved and saved[0] == wb_request[0]:
+            try:
+                render_wb_result(*saved)
+            except (wb.WorldBankError, requests.RequestException) as e:
+                st.session_state.pop("wb_request")
+                st.session_state["wb_error"] = (saved[0], str(e))
+        error = st.session_state.get("wb_error")
+        if error and error[0] == wb_request[0]:
+            st.error(f"World Bank request failed: {error[1]}")
+    except (wb.WorldBankError, requests.RequestException) as e:
+        st.error(f"Couldn't load World Bank metadata: {e}")
+    except Exception as e:  # an unexpected response shape shouldn't take down the other tabs
+        st.error(f"Couldn't display this World Bank data ({type(e).__name__}: {e}).")
+    st.caption("Data: The World Bank, World Bank Open Data (CC BY 4.0 for most indicators).")
 
 # --- IMF tab ---------------------------------------------------------------
 # Rendered before the Time Series tab so a series added here is selectable there on the same run.
@@ -2290,9 +2436,19 @@ with tab_series:
                 "`IMF:IMF.STA:CPI:USA.CPI._T.IX.M`."
             )
 
+        with st.expander("World Bank series", expanded=bool(st.session_state.get("ts_wb_series"))):
+            wb_chosen = st.multiselect(
+                "Series added from the World Bank tab", options=st.session_state.get("wb_added", []),
+                format_func=base_label, key="ts_wb_series",
+            )
+            st.caption(
+                "Any World Bank series also works typed as `WB:<database>:<indicator>:<country>:<A|Q|M>`, "
+                "e.g. `WB:2:NY.GDP.MKTP.KD.ZG:USA:A`."
+            )
+
         series_ids = tuple(dict.fromkeys(  # dedupe, keep order
             chosen_labels + nyfed_chosen + [nyfed.PD_PREFIX + k for k in pd_chosen] + bea_chosen
-            + census_chosen + bls_chosen + treasury_chosen + imf_chosen + custom_ids
+            + census_chosen + bls_chosen + treasury_chosen + imf_chosen + wb_chosen + custom_ids
         ))
 
         if series_ids:
